@@ -9,7 +9,7 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
-    "db:init": "node scripts/init-db.mjs"
+    "seed": "node scripts/seed-demo.mjs"
   },
   "dependencies": {
     "next": "15.5.4",
