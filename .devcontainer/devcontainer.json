@@ -3,8 +3,18 @@
   "dockerComposeFile": "docker-compose.yml",
   "service": "app",
   "workspaceFolder": "/workspaces/realtime-chat-app",
+
+  // sshd so the codespace can be driven headlessly, not only from an editor.
+  "features": {
+    "ghcr.io/devcontainers/features/sshd:1": {}
+  },
+
   "postCreateCommand": "npm install",
-  "postAttachCommand": "npm run dev",
+
+  // postStart, not postAttach: the server must come up when the codespace
+  // boots, whether or not an editor ever connects to it.
+  "postStartCommand": "nohup npm run dev > /tmp/dev.log 2>&1 &",
+
   "forwardPorts": [3000],
   "portsAttributes": {
     "3000": {
@@ -13,6 +23,7 @@
       "visibility": "public"
     }
   },
+
   "customizations": {
     "vscode": {
       "extensions": ["dbaeumer.vscode-eslint", "esbenp.prettier-vscode"]
