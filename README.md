@@ -416,7 +416,12 @@ request retries.
    ```bash
    node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
    ```
-4. Confirm with `GET /api/health` — it should report
+4. **Check deployment protection.** New Vercel projects default to *Vercel
+   Authentication*, which puts the deployment behind an SSO redirect — anyone
+   without dashboard access gets bounced to `vercel.com/sso-api` rather than the
+   app. If you want the URL to be shareable, turn it off under
+   **Settings → Deployment Protection**.
+5. Confirm with `GET /api/health` — it should report
    `{"ok":true,"store":"postgres","persistent":true}`.
 
 Until step 2, the deployment runs on the in-memory store: it will load and you
