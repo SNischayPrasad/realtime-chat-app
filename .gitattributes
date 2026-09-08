@@ -1,0 +1,5 @@
+* text=auto eol=lf
+
+# Shell scripts run inside the Linux devcontainer; a CRLF checkout would break
+# the shebang line.
+*.sh text eol=lf
