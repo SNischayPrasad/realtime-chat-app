@@ -20,7 +20,7 @@ Built with Next.js 15 (App Router) and TypeScript, deployed on Vercel.
 - [Privacy model for direct messages](#privacy-model-for-direct-messages)
 - [Data model](#data-model)
 - [Concurrency](#concurrency)
-- [Deploying to Vercel](#deploying-to-vercel)
+- [Deploying](#deploying)
 - [Screenshots](#screenshots)
 - [What is deliberately not built](#what-is-deliberately-not-built)
 
@@ -403,15 +403,44 @@ request retries.
 
 ---
 
-## Deploying to Vercel
+## Deploying
 
-1. Push to GitHub and import the repository at
-   [vercel.com/new](https://vercel.com/new). Framework detection handles the
-   build; no configuration needed.
-2. **Attach Postgres.** In the Vercel dashboard: **Storage → Create Database →
-   Neon (Postgres)**, then connect it to the project. That injects
-   `DATABASE_URL` automatically and triggers a redeploy. The schema is created on
-   the first request after that.
+The app is a Node server, not a static site: it has API routes, a long-lived
+Server-Sent Events connection and a Postgres dependency. **GitHub Pages cannot
+host it** — Pages serves static files only, and there is no `next export` of this
+app that keeps auth, history or live delivery working. The options below are the
+ones that can, ordered by how little setup they need.
+
+### GitHub Codespaces — no third-party account
+
+`.devcontainer/` describes the whole stack, so GitHub runs it for you:
+
+1. On the repository: **Code → Codespaces → Create codespace on main**.
+2. Wait for the build. `npm install` runs automatically, then `npm run dev`.
+3. Port 3000 forwards itself and is declared `public`, so the **Ports** tab shows
+   a shareable `https://<name>-3000.app.github.dev` URL.
+
+A real Postgres 16 runs beside the workspace with `DATABASE_URL` already wired,
+so history persists and two browsers see each other properly. The codespace
+stops after ~30 minutes idle and the URL sleeps with it — good for a demo or a
+screencast, not for something that must stay up.
+
+### Render — always-on URL, one file
+
+`render.yaml` is a blueprint: **New → Blueprint** on Render, pointed at this
+repository. It creates the web service and a free Postgres together, wires
+`DATABASE_URL` between them and generates `AUTH_SECRET`, so there are no
+environment variables to copy by hand. Free instances sleep after inactivity and
+cold-start in ~30s; the browser's `EventSource` reconnects on its own once the
+instance is back.
+
+### Vercel
+
+1. Import the repository at [vercel.com/new](https://vercel.com/new). Framework
+   detection handles the build; no configuration needed.
+2. **Attach Postgres.** **Storage → Create Database → Neon (Postgres)**, then
+   connect it to the project. That injects `DATABASE_URL` and triggers a
+   redeploy. The schema is created on the first request after that.
 3. **Set `AUTH_SECRET`** under Settings → Environment Variables:
    ```bash
    node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
@@ -421,15 +450,17 @@ request retries.
    without dashboard access gets bounced to `vercel.com/sso-api` rather than the
    app. If you want the URL to be shareable, turn it off under
    **Settings → Deployment Protection**.
-5. Confirm with `GET /api/health` — it should report
-   `{"ok":true,"store":"postgres","persistent":true}`.
-
-Until step 2, the deployment runs on the in-memory store: it will load and you
-can sign in, but messages will not persist and two users on different instances
-will not see each other.
 
 `maxDuration` on the stream route is 60s, within the Hobby plan's limit. Each
 open chat tab holds one streaming function invocation.
+
+### Verifying any of them
+
+`GET /api/health` should report
+`{"ok":true,"store":"postgres","persistent":true}`. If it reports
+`"store":"memory"` the database is not attached: the app will load and you can
+sign in, but messages will not persist and two users on different instances will
+not see each other.
 
 ---
 
