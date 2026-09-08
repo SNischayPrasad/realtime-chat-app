@@ -401,12 +401,23 @@ textarea {
   color: rgba(238, 241, 244, 0.42);
 }
 
-.rail__rooms {
+.rail__scroll {
   flex: 1;
   overflow-y: auto;
-  padding: 0 10px 10px;
+  padding-bottom: 10px;
+}
+
+.rail__list {
+  padding: 0 10px;
   margin: 0;
   list-style: none;
+}
+
+.rail__hint {
+  margin: 0;
+  padding: 2px 19px 6px;
+  font-size: 12.5px;
+  color: rgba(238, 241, 244, 0.38);
 }
 
 .room {
@@ -490,7 +501,7 @@ textarea {
 }
 
 .rail__new {
-  margin: 0 10px 10px;
+  margin: 6px 10px 10px;
   padding: 7px 9px;
   width: calc(100% - 20px);
   border: 1px dashed rgba(238, 241, 244, 0.24);
@@ -505,6 +516,40 @@ textarea {
 .rail__new:hover {
   border-color: rgba(238, 241, 244, 0.45);
   color: #fff;
+}
+
+.room--dm {
+  align-items: center;
+  gap: 9px;
+}
+
+.room__time {
+  margin-left: auto;
+  font-size: 10px;
+  color: rgba(238, 241, 244, 0.38);
+}
+
+.room--dm[aria-current="true"] .room__time {
+  color: rgba(255, 255, 255, 0.6);
+}
+
+/* Unread reads first as weight, then as the badge that confirms it. */
+.room--unread .room__name {
+  font-weight: 600;
+  color: #fff;
+}
+
+.pill {
+  margin-left: auto;
+  min-width: 18px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--pulse);
+  color: #fff;
+  font-size: 10.5px;
+  line-height: 16px;
+  text-align: center;
+  flex: none;
 }
 
 /* Conversation header + live wire -------------------------------------- */
@@ -528,6 +573,17 @@ textarea {
   margin: 1px 0 0;
   font-size: 13px;
   color: var(--muted);
+}
+
+.conv__topic.mono {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.lock {
+  color: var(--signal-bright);
+  font-size: 9px;
 }
 
 /* The signature element: the transport made visible. */
@@ -690,6 +746,21 @@ textarea {
   font-size: 11px;
 }
 
+.avatar--xs {
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  font-size: 9.5px;
+}
+
+.avatar--lg {
+  width: 52px;
+  height: 52px;
+  border-radius: 14px;
+  font-size: 19px;
+  margin: 0 auto 10px;
+}
+
 .msg__body {
   min-width: 0;
   max-width: min(640px, 78%);
@@ -839,6 +910,105 @@ textarea {
   color: var(--faint);
 }
 
+.roster__dm {
+  margin-left: auto;
+  padding: 3px 8px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+.roster__item:hover .roster__dm,
+.roster__dm:focus-visible {
+  opacity: 1;
+}
+
+.roster__dm:hover {
+  color: var(--signal);
+  border-color: var(--signal-bright);
+}
+
+/* Counterpart card, shown in place of the roster inside a private chat ---- */
+
+.counterpart {
+  padding: 8px 16px 16px;
+  text-align: center;
+}
+
+.counterpart__name {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.counterpart__handle {
+  margin: 2px 0 0;
+  font-size: 11.5px;
+  color: var(--faint);
+}
+
+.counterpart__status {
+  margin: 10px 0 0;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.counterpart__note {
+  margin: 14px 0 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--rule);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--faint);
+}
+
+/* People picker ---------------------------------------------------------- */
+
+.picker__list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.picker__row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.picker__row:hover {
+  background: var(--paper-deep);
+}
+
+.picker__name {
+  font-size: 13.5px;
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.picker__handle {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--faint);
+}
+
 .roster__note {
   margin-top: auto;
   padding: 14px 16px;
@@ -918,16 +1088,32 @@ textarea {
 
   .rail__head,
   .rail__section,
-  .rail__new {
+  .rail__hint {
     display: none;
   }
 
-  .rail__rooms {
+  .rail__scroll {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding-bottom: 0;
+    flex: 1;
+  }
+
+  .rail__list {
     display: flex;
     gap: 6px;
     padding: 0;
-    overflow-x: auto;
-    flex: 1;
+    flex: none;
+  }
+
+  .rail__new {
+    margin: 0;
+    width: auto;
+    flex: none;
+    white-space: nowrap;
   }
 
   .room {

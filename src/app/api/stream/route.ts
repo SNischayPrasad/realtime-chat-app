@@ -5,6 +5,7 @@ import {
   STREAM_TTL_MS,
 } from '@/lib/config';
 import { jsonError } from '@/lib/http';
+import { loadRoomFor } from '@/lib/rooms';
 import { getStore } from '@/lib/store';
 
 export const runtime = 'nodejs';
@@ -31,6 +32,10 @@ export const maxDuration = 60;
  *   presence  - who is currently in the room and who is typing
  *   reconnect - the server is closing cleanly, reconnect now
  *   error     - a fatal problem; the client should stop and surface it
+ *
+ * Access is resolved by `loadRoomFor`, so a stream can only ever be opened for
+ * a public room or a private conversation the caller belongs to. In a private
+ * conversation the roster is built from membership rather than presence.
  */
 
 function frame(event: string, data: unknown, id?: string): string {
@@ -63,7 +68,10 @@ export async function GET(request: Request) {
   if (!roomParam) return jsonError(400, 'roomId is required');
 
   const store = getStore();
-  const room = await store.findRoom(roomParam);
+  // Guarded before the ReadableStream is built and before any presence write:
+  // an unauthorized stream would be a live firehose of a private conversation,
+  // and its presence row would seat the intruder in the participants' roster.
+  const room = await loadRoomFor(user, roomParam);
   if (!room) return jsonError(404, 'Room not found');
 
   // On a reconnect the browser replays the last id it saw, which is more
@@ -115,6 +123,7 @@ export async function GET(request: Request) {
         username: string;
         displayName: string;
         avatarHue: number;
+        live: boolean;
       }> = [];
 
       try {
@@ -135,12 +144,29 @@ export async function GET(request: Request) {
           if (refreshRoster) {
             lastPresenceTouch = now;
             await store.touchPresence(room.id, user.id);
-            onlineRoster = (await store.listPresence(room.id)).map((entry) => ({
-              userId: entry.userId,
-              username: entry.username,
-              displayName: entry.displayName,
-              avatarHue: entry.avatarHue,
-            }));
+
+            const present = await store.listPresence(room.id);
+            if (room.kind === 'dm') {
+              // A 1:1 roster is derived from membership, never from presence,
+              // so a stray presence row can never show a third face in a
+              // private conversation. Presence only decides the live dot.
+              const live = new Set(present.map((entry) => entry.userId));
+              onlineRoster = (await store.listRoomMembers(room.id)).map((member) => ({
+                userId: member.id,
+                username: member.username,
+                displayName: member.displayName,
+                avatarHue: member.avatarHue,
+                live: live.has(member.id),
+              }));
+            } else {
+              onlineRoster = present.map((entry) => ({
+                userId: entry.userId,
+                username: entry.username,
+                displayName: entry.displayName,
+                avatarHue: entry.avatarHue,
+                live: true,
+              }));
+            }
           }
 
           const typing = await store.listTyping(room.id);

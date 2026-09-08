@@ -10,7 +10,18 @@ export default async function ChatPage() {
   const user = await getCurrentUser();
   if (!user) redirect('/login');
 
-  const rooms = await getStore().listRooms();
+  const store = getStore();
+  const [rooms, conversations] = await Promise.all([
+    store.listRooms(),
+    store.listConversations(user.id),
+  ]);
 
-  return <ChatClient user={user} initialRooms={rooms} persistent={HAS_DATABASE} />;
+  return (
+    <ChatClient
+      user={user}
+      initialRooms={rooms}
+      initialConversations={conversations}
+      persistent={HAS_DATABASE}
+    />
+  );
 }

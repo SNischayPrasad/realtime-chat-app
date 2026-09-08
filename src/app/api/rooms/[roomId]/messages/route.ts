@@ -9,6 +9,7 @@ import {
   unauthorized,
   validateMessageBody,
 } from '@/lib/http';
+import { loadRoomFor } from '@/lib/rooms';
 import { getStore } from '@/lib/store';
 
 export const runtime = 'nodejs';
@@ -35,7 +36,9 @@ export async function GET(request: Request, context: { params: Promise<{ roomId:
 
   try {
     const store = getStore();
-    const room = await store.findRoom(roomId);
+    // Authorization and lookup in one step: a DM the caller is not part of
+    // returns null and 404s exactly like a room that does not exist.
+    const room = await loadRoomFor(user, roomId);
     if (!room) return jsonError(404, 'Room not found');
 
     const messages = await store.listMessages({
@@ -79,7 +82,7 @@ export async function POST(request: Request, context: { params: Promise<{ roomId
 
   try {
     const store = getStore();
-    const room = await store.findRoom(roomId);
+    const room = await loadRoomFor(user, roomId);
     if (!room) return jsonError(404, 'Room not found');
 
     const message = await store.createMessage({

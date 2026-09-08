@@ -126,6 +126,29 @@ CREATE TABLE IF NOT EXISTS typing_state (
   expires_at TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (room_id, user_id)
 );
+
+-- Private 1:1 conversations -------------------------------------------------
+-- Additive and idempotent, so this applies cleanly to a database that already
+-- holds rooms and messages. Existing rows take kind='public' from the default.
+
+ALTER TABLE rooms ADD COLUMN IF NOT EXISTS kind   TEXT NOT NULL DEFAULT 'public';
+ALTER TABLE rooms ADD COLUMN IF NOT EXISTS dm_key TEXT;
+
+-- The canonical "these two people" key. This partial unique index is what makes
+-- a duplicate DM thread impossible when both users start one at the same moment
+-- on two different serverless instances.
+CREATE UNIQUE INDEX IF NOT EXISTS rooms_dm_key_idx ON rooms (dm_key) WHERE dm_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS rooms_kind_idx ON rooms (kind);
+
+CREATE TABLE IF NOT EXISTS room_members (
+  room_id      TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+  user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  joined_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_read_id BIGINT NOT NULL DEFAULT 0,
+  PRIMARY KEY (room_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS room_members_user_idx ON room_members (user_id, room_id);
 `;
 
 const SEED_ROOMS: Array<{ id: string; slug: string; name: string; topic: string }> = [
