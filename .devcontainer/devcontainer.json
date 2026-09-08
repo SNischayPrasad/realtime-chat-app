@@ -6,8 +6,8 @@
     "ghcr.io/devcontainers/features/sshd:1": {}
   },
 
-  "onCreateCommand": ".devcontainer/setup.sh",
-  "postStartCommand": ".devcontainer/start.sh",
+  "onCreateCommand": "bash .devcontainer/setup.sh",
+  "postStartCommand": "bash .devcontainer/start.sh",
 
   "forwardPorts": [3000],
   "portsAttributes": {
