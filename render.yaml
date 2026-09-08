@@ -1,0 +1,27 @@
+# One-click blueprint for a permanent, always-on deployment.
+# On Render: New -> Blueprint -> point it at this repository. The web service and
+# a free Postgres are created together, DATABASE_URL is wired between them, and
+# AUTH_SECRET is generated - no environment variables to copy by hand.
+services:
+  - type: web
+    name: transmission-chat
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: transmission-db
+          property: connectionString
+      - key: AUTH_SECRET
+        generateValue: true
+      - key: NODE_VERSION
+        value: "22"
+
+databases:
+  - name: transmission-db
+    plan: free
+    databaseName: chat
+    user: chat
