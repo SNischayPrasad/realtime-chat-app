@@ -1,22 +1,13 @@
 {
   "name": "Transmission real-time chat",
-  "dockerComposeFile": "docker-compose.yml",
-  "service": "app",
-  "workspaceFolder": "/workspaces/realtime-chat-app",
+  "image": "mcr.microsoft.com/devcontainers/typescript-node:1-22-bookworm",
 
-  // sshd so the codespace can be driven headlessly, not only from an editor.
   "features": {
     "ghcr.io/devcontainers/features/sshd:1": {}
   },
 
-  "postCreateCommand": "npm install",
-
-  // postStart, not postAttach: the server must come up when the codespace
-  // boots, whether or not an editor ever connects to it. setsid detaches it
-  // into its own session so it survives the setup shell exiting, and the
-  // explicit 0.0.0.0 bind is what lets the port forwarder reach it from
-  // outside the container.
-  "postStartCommand": "bash -lc 'cd /workspaces/realtime-chat-app && (setsid nohup npm run dev -- -H 0.0.0.0 -p 3000 > /tmp/dev.log 2>&1 < /dev/null &)'",
+  "onCreateCommand": ".devcontainer/setup.sh",
+  "postStartCommand": ".devcontainer/start.sh",
 
   "forwardPorts": [3000],
   "portsAttributes": {
@@ -25,6 +16,11 @@
       "onAutoForward": "openPreview",
       "visibility": "public"
     }
+  },
+
+  "remoteEnv": {
+    "DATABASE_URL": "postgres://chat:chat@localhost:5432/chat?sslmode=disable",
+    "AUTH_SECRET": "codespace-development-secret-not-for-production"
   },
 
   "customizations": {
