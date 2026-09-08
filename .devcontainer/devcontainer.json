@@ -12,8 +12,11 @@
   "postCreateCommand": "npm install",
 
   // postStart, not postAttach: the server must come up when the codespace
-  // boots, whether or not an editor ever connects to it.
-  "postStartCommand": "nohup npm run dev > /tmp/dev.log 2>&1 &",
+  // boots, whether or not an editor ever connects to it. setsid detaches it
+  // into its own session so it survives the setup shell exiting, and the
+  // explicit 0.0.0.0 bind is what lets the port forwarder reach it from
+  // outside the container.
+  "postStartCommand": "bash -lc 'cd /workspaces/realtime-chat-app && (setsid nohup npm run dev -- -H 0.0.0.0 -p 3000 > /tmp/dev.log 2>&1 < /dev/null &)'",
 
   "forwardPorts": [3000],
   "portsAttributes": {
