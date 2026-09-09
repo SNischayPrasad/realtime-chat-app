@@ -1,10 +1,10 @@
 {
   "name": "Transmission real-time chat",
-  "image": "mcr.microsoft.com/devcontainers/typescript-node:1-22-bookworm",
 
-  "features": {
-    "ghcr.io/devcontainers/features/sshd:1": {}
-  },
+  // No "image", no "features", no compose: the stock Codespaces image is the
+  // only configuration that reliably gets GitHub's own bootstrap, which is what
+  // makes `gh codespace ssh` and `gh codespace logs` work. Every customisation
+  // tried here cost that, and with it any way to diagnose a failed boot.
 
   "onCreateCommand": "bash .devcontainer/setup.sh",
   "postStartCommand": "bash .devcontainer/start.sh",
@@ -16,11 +16,6 @@
       "onAutoForward": "openPreview",
       "visibility": "public"
     }
-  },
-
-  "remoteEnv": {
-    "DATABASE_URL": "postgres://chat:chat@localhost:5432/chat?sslmode=disable",
-    "AUTH_SECRET": "codespace-development-secret-not-for-production"
   },
 
   "customizations": {
