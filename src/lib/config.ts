@@ -16,13 +16,53 @@ function firstDefined(...names: string[]): string | undefined {
   return undefined;
 }
 
-export const DATABASE_URL = firstDefined(
-  'DATABASE_URL',
-  'POSTGRES_URL',
-  'POSTGRES_PRISMA_URL',
-  'DATABASE_URL_UNPOOLED',
-  'POSTGRES_URL_NON_POOLING',
-);
+function isPostgresUrl(value: string | undefined): value is string {
+  return Boolean(value && /^postgres(ql)?:\/\//i.test(value.trim()));
+}
+
+/**
+ * Finds the Postgres connection string.
+ *
+ * The known names are tried first, then anything in the environment that is
+ * literally a `postgres://` URL. That fallback exists because Vercel's storage
+ * integrations let you pick your own variable prefix when connecting a
+ * database - choosing "STORAGE" yields `STORAGE_URL`, not `DATABASE_URL` - and
+ * a connected database that the app silently ignores is a miserable failure to
+ * diagnose. Pooled names are preferred over direct ones, which matters on
+ * serverless where connection count is the scarce resource.
+ */
+function resolveDatabaseUrl(): string | undefined {
+  const known = firstDefined(
+    'DATABASE_URL',
+    'POSTGRES_URL',
+    'STORAGE_URL',
+    'POSTGRES_PRISMA_URL',
+    'DATABASE_URL_UNPOOLED',
+    'POSTGRES_URL_NON_POOLING',
+    'STORAGE_URL_NON_POOLING',
+  );
+  if (isPostgresUrl(known)) return known.trim();
+
+  const candidates = Object.keys(process.env)
+    .filter((name) => isPostgresUrl(process.env[name]))
+    // A name containing "unpooled" or "non_pooling" is the direct connection;
+    // keep it only as a last resort.
+    .sort((a, b) => Number(/UNPOOLED|NON_POOLING/i.test(a)) - Number(/UNPOOLED|NON_POOLING/i.test(b)));
+
+  if (candidates.length > 0) {
+    const chosen = candidates[0];
+    if (!known) {
+      console.warn(
+        `[config] Using Postgres connection string from ${chosen}. ` +
+          'Set DATABASE_URL explicitly to pin it.',
+      );
+    }
+    return process.env[chosen]?.trim();
+  }
+  return undefined;
+}
+
+export const DATABASE_URL = resolveDatabaseUrl();
 
 export const HAS_DATABASE = Boolean(DATABASE_URL);
 
