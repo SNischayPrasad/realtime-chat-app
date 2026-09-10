@@ -8,11 +8,6 @@ Built with Next.js 15 (App Router) and TypeScript, deployed on Vercel.
 
 **Live:** https://realtime-chat-app-n-green-ve.vercel.app
 
-> The live deployment needs Postgres attached to be usable. Until then it runs on
-> the in-memory development store, and because each serverless instance holds its
-> own copy, a session created on one instance is unrecognised by the next and you
-> are signed out again. `GET /api/health` reports which store is active; see
-> [Deploying](#deploying) for attaching a database.
 
 ![The chat, with public rooms and private conversations in the rail](docs/screenshots/02-public-room.png)
 
@@ -350,8 +345,14 @@ list nor their conversation list.
 
 ## Verified behaviour
 
-Results from running the checks against a local production build
-(`npm run build && npm run start`), with three accounts: `ada`, `linus`, `grace`.
+Results from running the checks against the **live deployment** on Vercel,
+backed by Neon Postgres (`/api/health` reporting
+`{"ok":true,"store":"postgres","persistent":true}`), with three accounts.
+
+**Sessions survive instance changes.** Ten sequential `GET /api/auth/me` calls
+with one cookie returned `200` ten times. On the in-memory store the same check
+returned `401` ten times, because each serverless instance held its own copy and
+none of them recognised a session created on another.
 
 **Private conversation access control.** `ada` and `linus` share a DM. Every
 route `grace` can reach with that room id was tried:
@@ -374,13 +375,15 @@ in `/api/rooms`, and the message body is unreachable.
 returned **one** room id, enforced by the unique index on `rooms.dm_key` rather
 than by application-level checking.
 
-**Concurrency.** Forty concurrent `POST /api/rooms/general/messages` across two
-accounts, with six SSE streams open: 40/40 `201`, all 40 messages persisted, no
-`5xx`, nothing in the server log.
+**Concurrency.** Thirty concurrent `POST /api/rooms/general/messages` across two
+accounts against Postgres: 30/30 `201`, every message persisted, no `5xx`.
+
+**Idempotency.** Replaying a `clientNonce` returned the id of the original
+message rather than inserting a second row.
 
 **Live delivery.** With one client holding an SSE stream, a message posted by
-another account arrived as an `event: message` frame carrying its cursor id,
-without a refresh.
+another account over a separate connection arrived as an `event: message` frame
+carrying its cursor id, without a refresh.
 
 ---
 
