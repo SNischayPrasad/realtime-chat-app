@@ -12,7 +12,7 @@
     "seed": "node scripts/seed-demo.mjs"
   },
   "dependencies": {
-    "next": "15.5.4",
+    "next": "15.5.25",
     "pg": "8.16.3",
     "react": "19.1.1",
     "react-dom": "19.1.1"
