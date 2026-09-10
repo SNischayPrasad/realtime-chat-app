@@ -10,7 +10,8 @@
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "seed": "node scripts/seed-demo.mjs",
-    "verify": "node scripts/verify.mjs"
+    "verify": "node scripts/verify.mjs",
+    "test:crypto": "node --test --experimental-strip-types src/lib/e2ee/crypto.test.ts"
   },
   "dependencies": {
     "next": "15.5.25",
