@@ -1,5 +1,6 @@
 import { redirect } from 'next/navigation';
 import { getCurrentUser } from '@/lib/auth';
+import { UNCONFIGURED_IN_PRODUCTION } from '@/lib/config';
 import AuthForm from './AuthForm';
 
 export const dynamic = 'force-dynamic';
@@ -42,8 +43,30 @@ export default async function LoginPage() {
       </section>
 
       <section className="auth__form-pane">
-        <AuthForm />
+        <div style={{ width: '100%', maxWidth: 380 }}>
+          {UNCONFIGURED_IN_PRODUCTION && <NoDatabaseNotice />}
+          <AuthForm />
+        </div>
       </section>
     </main>
+  );
+}
+
+/**
+ * Shown only when the deployment is missing its datastore. It explains the
+ * failure the visitor is about to hit instead of letting them sign up and be
+ * silently logged out again.
+ */
+function NoDatabaseNotice() {
+  return (
+    <div className="notice" role="status">
+      <strong className="notice__title">No database attached</strong>
+      <p className="notice__body">
+        This deployment is running on the in-memory development store, so accounts and
+        messages are not saved and you will be signed out as soon as another server
+        instance handles your request. Attach Postgres to the project and redeploy;{' '}
+        <code>/api/health</code> reports which store is live.
+      </p>
+    </div>
   );
 }

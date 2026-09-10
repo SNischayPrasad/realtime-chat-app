@@ -27,6 +27,15 @@ export const DATABASE_URL = firstDefined(
 export const HAS_DATABASE = Boolean(DATABASE_URL);
 
 /**
+ * A production deployment with no database is not merely degraded, it is
+ * broken: every serverless instance keeps its own copy of the in-memory store,
+ * so a session created on one instance is unrecognised by the next and the user
+ * is silently signed out. Surfaced in the UI rather than left to be discovered.
+ */
+export const UNCONFIGURED_IN_PRODUCTION =
+  !HAS_DATABASE && process.env.NODE_ENV === 'production';
+
+/**
  * Key used to sign session cookies.
  *
  * `AUTH_SECRET` is the supported way to set this. When it is missing we fall

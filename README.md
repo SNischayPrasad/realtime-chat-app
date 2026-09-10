@@ -6,6 +6,14 @@ persisted to Postgres, so the conversation is still there tomorrow.
 
 Built with Next.js 15 (App Router) and TypeScript, deployed on Vercel.
 
+**Live:** https://realtime-chat-app-n-green-ve.vercel.app
+
+> The live deployment needs Postgres attached to be usable. Until then it runs on
+> the in-memory development store, and because each serverless instance holds its
+> own copy, a session created on one instance is unrecognised by the next and you
+> are signed out again. `GET /api/health` reports which store is active; see
+> [Deploying](#deploying) for attaching a database.
+
 ![The chat, with public rooms and private conversations in the rail](docs/screenshots/02-public-room.png)
 
 ---
