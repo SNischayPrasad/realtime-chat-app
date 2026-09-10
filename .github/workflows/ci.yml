@@ -21,4 +21,9 @@ jobs:
       # Type errors and build failures should surface on the push that caused
       # them, not on the next deploy attempt.
       - run: npm run typecheck
+
+      # The encryption primitives are the one place where a silent regression
+      # is unrecoverable rather than merely annoying.
+      - run: npm run test:crypto
+
       - run: npm run build
