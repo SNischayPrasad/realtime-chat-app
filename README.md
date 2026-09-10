@@ -26,6 +26,7 @@ Built with Next.js 15 (App Router) and TypeScript, deployed on Vercel.
 - [HTTP API](#http-api)
 - [Server-Sent Events](#server-sent-events)
 - [Privacy model for direct messages](#privacy-model-for-direct-messages)
+- [Verified behaviour](#verified-behaviour)
 - [Data model](#data-model)
 - [Concurrency](#concurrency)
 - [Deploying](#deploying)
@@ -344,6 +345,42 @@ Verified by test: a signed-in non-member hitting the DM by room id, by slug,
 posting, typing, marking read, and opening the stream all return `404` with a
 body identical to a nonexistent room, and the DM appears in neither their room
 list nor their conversation list.
+
+---
+
+## Verified behaviour
+
+Results from running the checks against a local production build
+(`npm run build && npm run start`), with three accounts: `ada`, `linus`, `grace`.
+
+**Private conversation access control.** `ada` and `linus` share a DM. Every
+route `grace` can reach with that room id was tried:
+
+| Attempt by a non-member | Result |
+| --- | --- |
+| `GET /api/rooms/:id/messages` | `404` |
+| `POST /api/rooms/:id/messages` | `404` |
+| `GET /api/stream?roomId=:id` | `404` |
+| `POST /api/rooms/:id/typing` | `404` |
+| `POST /api/rooms/:id/read` | `404` |
+| `GET /api/rooms/room_doesnotexist/messages` | `404` |
+
+The last row is the point: a private room the caller is not in is byte-identical
+to one that does not exist, so the API cannot be used to discover that a
+conversation exists. `grace`'s `/api/conversations` is `[]`, the DM never appears
+in `/api/rooms`, and the message body is unreachable.
+
+**Race safety.** Eight simultaneous `POST /api/conversations` for the same pair
+returned **one** room id, enforced by the unique index on `rooms.dm_key` rather
+than by application-level checking.
+
+**Concurrency.** Forty concurrent `POST /api/rooms/general/messages` across two
+accounts, with six SSE streams open: 40/40 `201`, all 40 messages persisted, no
+`5xx`, nothing in the server log.
+
+**Live delivery.** With one client holding an SSE stream, a message posted by
+another account arrived as an `event: message` frame carrying its cursor id,
+without a refresh.
 
 ---
 
