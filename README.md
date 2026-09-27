@@ -360,6 +360,10 @@ Against a production build with a real Postgres 18 — and again on the live Ver
 `npm run test:calls` — **13/13**: a real video call between two Chrome
 instances; both receive live video and audio; **21 signalling messages stored,
 0 readable**; mute propagates; hang-up ends it and the signalling is deleted.
+Against the live Vercel deployment it also passes (8/8 — the five database
+checks need direct database access): signalling through serverless functions
+and Neon, live video and audio both ways. Both browsers ran on one machine, so
+this does not prove NAT traversal between different networks.
 
 By hand, in a browser:
 
