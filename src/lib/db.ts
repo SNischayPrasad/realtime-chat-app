@@ -149,6 +149,186 @@ CREATE TABLE IF NOT EXISTS room_members (
 );
 
 CREATE INDEX IF NOT EXISTS room_members_user_idx ON room_members (user_id, room_id);
+
+-- ===========================================================================
+-- Friends, end-to-end encryption, and calls.
+--
+-- Additive and idempotent throughout. Every ADD COLUMN is nullable or
+-- NOT NULL DEFAULT <constant>, which Postgres 11+ applies without rewriting
+-- the table. No existing column changes type or nullability.
+-- ===========================================================================
+
+-- Auth versions.
+--   auth_version 0: legacy account; password_hash is scrypt(raw password) and
+--                   there is no key vault. Every account created before this.
+--   auth_version 1: password_hash is scrypt(authSecret); the raw password never
+--                   reaches the server again.
+-- token_version lets the server revoke outstanding (otherwise stateless)
+-- session cookies, e.g. when an account is upgraded.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_version  SMALLINT NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER  NOT NULL DEFAULT 0;
+
+-- The key vault. There is no salt or iteration-count column on purpose: both
+-- are client-side constants, so a hostile server has nothing to lie about.
+CREATE TABLE IF NOT EXISTS user_keys (
+  user_id          TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  vault_id         TEXT NOT NULL,
+  identity_pub     TEXT NOT NULL,
+  kdf_version      SMALLINT NOT NULL DEFAULT 1,
+  vault_ct         TEXT NOT NULL,
+  vault_iv         TEXT NOT NULL,
+  vault_version    INTEGER NOT NULL DEFAULT 1,
+  recovery_ct      TEXT,
+  recovery_iv      TEXT,
+  recovery_version INTEGER NOT NULL DEFAULT 0,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS user_keys_vault_id_idx ON user_keys (vault_id);
+
+-- Message envelope.
+--   enc_version 0: body is plaintext. Every existing row, and every public-room
+--                  message from now on.
+--   enc_version 1: body is base64url(AES-GCM ciphertext and tag); enc_iv and
+--                  enc_epoch are set. The IV has its own column so anyone with
+--                  a psql prompt can see at a glance that body is opaque.
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS enc_version SMALLINT NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS enc_iv      TEXT;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS enc_epoch   TEXT;
+
+-- The first encrypted message in a room sets this. After it, the server refuses
+-- plaintext writes to that room.
+ALTER TABLE rooms ADD COLUMN IF NOT EXISTS e2ee_since_id BIGINT;
+
+-- Rate limiting. Serverless instances share no memory, so the database is the
+-- only place a counter can live. One row per bucket, fixed window.
+CREATE TABLE IF NOT EXISTS rate_limits (
+  bucket       TEXT PRIMARY KEY,
+  window_start TIMESTAMPTZ NOT NULL DEFAULT now(),
+  count        INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS rate_limits_window_idx ON rate_limits (window_start);
+
+-- Friends. One row per PAIR, stored pre-sorted so (A,B) and (B,A) collide on
+-- the primary key. That single constraint makes duplicate requests, reciprocal
+-- pending requests and the simultaneous-mutual-request race impossible without
+-- any application-level locking.
+CREATE TABLE IF NOT EXISTS friendships (
+  low_user_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  high_user_id  TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  status        TEXT NOT NULL DEFAULT 'pending',
+  requested_by  TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  request_count INTEGER NOT NULL DEFAULT 1,
+  requested_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  responded_at  TIMESTAMPTZ,
+  PRIMARY KEY (low_user_id, high_user_id),
+  -- COLLATE "C" pins byte order so Postgres agrees with the JS sort that
+  -- builds the pair. A locale-aware collation could order it differently and
+  -- admit both (A,B) and (B,A).
+  CONSTRAINT friendships_ordered_pair CHECK ((low_user_id COLLATE "C") < high_user_id),
+  CONSTRAINT friendships_status       CHECK (status IN ('pending','accepted','declined')),
+  CONSTRAINT friendships_requester    CHECK (requested_by IN (low_user_id, high_user_id))
+);
+
+CREATE INDEX IF NOT EXISTS friendships_high_idx ON friendships (high_user_id, status);
+CREATE INDEX IF NOT EXISTS friendships_pending_idx
+  ON friendships (requested_by) WHERE status = 'pending';
+
+-- Blocking is one-directional, so it gets its own table rather than a status
+-- on the symmetric pair row - which could represent neither a mutual block nor
+-- the friendship that must return on unblock.
+CREATE TABLE IF NOT EXISTS user_blocks (
+  blocker_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  blocked_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (blocker_id, blocked_id),
+  CONSTRAINT user_blocks_not_self CHECK (blocker_id <> blocked_id)
+);
+
+CREATE INDEX IF NOT EXISTS user_blocks_blocked_idx ON user_blocks (blocked_id, blocker_id);
+
+-- Grandfather every conversation that already exists: two people who already
+-- share a private room have already consented to talk, and must not be locked
+-- out by a rule invented afterwards.
+--
+-- A failure here aborts ensureSchema() and takes the whole app down, so it is
+-- defensive: LEAST/GREATEST re-sort under COLLATE "C" so a legacy key cannot
+-- trip the ordered-pair CHECK; the EXISTS checks stop a deleted user raising a
+-- foreign-key violation; x <> y drops a malformed self-pair. ON CONFLICT makes
+-- the rerun on every cold start free.
+INSERT INTO friendships (low_user_id, high_user_id, status, requested_by, requested_at, responded_at)
+SELECT LEAST(a.x COLLATE "C", a.y),
+       GREATEST(a.x COLLATE "C", a.y),
+       'accepted',
+       CASE WHEN a.created_by IN (a.x, a.y) THEN a.created_by
+            ELSE LEAST(a.x COLLATE "C", a.y) END,
+       a.created_at,
+       a.created_at
+FROM (
+  SELECT split_part(dm_key, '|', 1) AS x,
+         split_part(dm_key, '|', 2) AS y,
+         created_by,
+         created_at
+  FROM rooms
+  WHERE kind = 'dm' AND dm_key IS NOT NULL
+) a
+WHERE a.x <> '' AND a.y <> '' AND a.x <> a.y
+  AND EXISTS (SELECT 1 FROM users u WHERE u.id = a.x)
+  AND EXISTS (SELECT 1 FROM users u WHERE u.id = a.y)
+ON CONFLICT (low_user_id, high_user_id) DO NOTHING;
+
+-- Calls. No CHECK constraints on state or media: widening a CHECK later is not
+-- an additive change, and this app has no migration tool. The closed sets are
+-- validated in application code instead.
+CREATE TABLE IF NOT EXISTS calls (
+  id           TEXT PRIMARY KEY,
+  room_id      TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+  caller_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  callee_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  media        TEXT NOT NULL DEFAULT 'audio',
+  state        TEXT NOT NULL DEFAULT 'ringing',
+  end_reason   TEXT,
+  client_nonce TEXT,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  answered_at  TIMESTAMPTZ,
+  ended_at     TIMESTAMPTZ,
+  -- Heartbeated while connected. Without it, two force-killed tabs would leave
+  -- a call 'accepted' forever and every later call would return busy.
+  last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS calls_room_idx ON calls (room_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS calls_caller_live_idx
+  ON calls (caller_id, created_at DESC) WHERE state IN ('ringing', 'accepted');
+CREATE INDEX IF NOT EXISTS calls_callee_live_idx
+  ON calls (callee_id, created_at DESC) WHERE state IN ('ringing', 'accepted');
+CREATE UNIQUE INDEX IF NOT EXISTS calls_nonce_idx
+  ON calls (caller_id, client_nonce) WHERE client_nonce IS NOT NULL;
+
+-- Call signalling (SDP offers and answers, ICE candidates). The payload is
+-- sealed with a key derived from both users' identity keys, so the server
+-- never holds a readable SDP: plaintext would put both users' IP addresses in
+-- the database and let anyone who can write this row substitute a DTLS
+-- fingerprint and intercept the media.
+CREATE TABLE IF NOT EXISTS call_signals (
+  id           BIGSERIAL PRIMARY KEY,
+  call_id      TEXT NOT NULL REFERENCES calls(id) ON DELETE CASCADE,
+  room_id      TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+  from_user    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  to_user      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  kind         TEXT NOT NULL,
+  sig_nonce    TEXT NOT NULL,
+  enc_iv       TEXT NOT NULL,
+  payload      TEXT NOT NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at   TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '2 minutes')
+);
+
+CREATE INDEX IF NOT EXISTS call_signals_inbox_idx  ON call_signals (to_user, id);
+CREATE INDEX IF NOT EXISTS call_signals_call_idx   ON call_signals (call_id);
+CREATE INDEX IF NOT EXISTS call_signals_expiry_idx ON call_signals (expires_at);
 `;
 
 const SEED_ROOMS: Array<{ id: string; slug: string; name: string; topic: string }> = [

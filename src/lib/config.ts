@@ -88,6 +88,24 @@ export const SESSION_SECRET =
   firstDefined('AUTH_SECRET', 'NEXTAUTH_SECRET') ??
   (DATABASE_URL ? `derived:${DATABASE_URL}` : 'insecure-development-only-secret');
 
+/**
+ * Whether the session-signing key was set explicitly. When it is derived from
+ * the database URL, a leaked connection string also lets someone mint session
+ * cookies. Reported by /api/health rather than enforced, because refusing to
+ * serve would take a running deployment down over a configuration gap.
+ */
+export const SESSION_KEY_EXPLICIT = Boolean(firstDefined('AUTH_SECRET', 'NEXTAUTH_SECRET'));
+
+/**
+ * After this date the server refuses the legacy login shape (raw password)
+ * outright. Accounts created before encryption existed must sign in once before
+ * then to be upgraded; after it, the password never travels to the server under
+ * any circumstances. Override with CHAT_LEGACY_AUTH_UNTIL (an ISO date).
+ */
+export const LEGACY_AUTH_UNTIL = Date.parse(
+  process.env.CHAT_LEGACY_AUTH_UNTIL ?? '2026-11-15T00:00:00Z',
+);
+
 export const SESSION_COOKIE = 'chat_session';
 export const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 7; // 7 days
 
@@ -119,5 +137,15 @@ export const PRESENCE_WINDOW_MS = 45_000;
 export const TYPING_TTL_MS = 6_000;
 
 export const MAX_MESSAGE_LENGTH = 2000;
+
+/**
+ * Derived, not chosen by eye: MAX_MESSAGE_LENGTH characters at the worst case
+ * of 4 UTF-8 bytes each, plus ~256 bytes of envelope JSON, padded up to the
+ * 256-byte bucket, plus the 16-byte GCM tag, then base64url-expanded by 4/3:
+ *   ceil((ceil((2000*4 + 256) / 256) * 256 + 16) * 4 / 3) = 11,286 -> 12,000.
+ * A smaller cap would reject legitimate non-Latin messages well below the
+ * advertised 2000 characters; the crypto tests round-trip 2000 emoji.
+ */
+export const MAX_CIPHERTEXT_LENGTH = 12_000;
 export const DEFAULT_HISTORY_LIMIT = 50;
 export const MAX_HISTORY_LIMIT = 200;

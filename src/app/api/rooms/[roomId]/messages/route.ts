@@ -1,16 +1,22 @@
 import { NextResponse } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
-import { DEFAULT_HISTORY_LIMIT, MAX_HISTORY_LIMIT } from '@/lib/config';
+import { DEFAULT_HISTORY_LIMIT, MAX_CIPHERTEXT_LENGTH, MAX_HISTORY_LIMIT } from '@/lib/config';
 import {
   asString,
   clampLimit,
+  EPOCH_PATTERN,
+  isBase64Url,
+  IV_PATTERN,
   jsonError,
+  NONCE_PATTERN,
   readJson,
   unauthorized,
   validateMessageBody,
 } from '@/lib/http';
-import { loadRoomFor } from '@/lib/rooms';
+import { counterpartOf, loadRoomFor } from '@/lib/rooms';
+import { getSocial } from '@/lib/social';
 import { getStore } from '@/lib/store';
+import { NonceConflictError } from '@/lib/types';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -23,7 +29,8 @@ export const dynamic = 'force-dynamic';
  *   limit - page size (default 50, max 200)
  *
  * Without `after` the newest page is returned in chronological order, which is
- * what the UI needs to paint history on first load.
+ * what the UI needs to paint history on first load. Encrypted messages come
+ * back as ciphertext; only the two participants' browsers can read them.
  */
 export async function GET(request: Request, context: { params: Promise<{ roomId: string }> }) {
   const user = await getCurrentUser();
@@ -61,11 +68,17 @@ export async function GET(request: Request, context: { params: Promise<{ roomId:
 /**
  * POST /api/rooms/:roomId/messages
  *
- * Body: { body: string, clientNonce?: string }
+ * Plaintext (public rooms, and private rooms before either side has keys):
+ *   { body, clientNonce? }
  *
- * `clientNonce` makes the write idempotent: a retried request (double submit,
- * flaky network) resolves to the same stored message instead of a duplicate.
- * The new message reaches every other participant over the SSE stream.
+ * End-to-end encrypted (private rooms):
+ *   { encVersion: 1, body: <base64url ciphertext>, iv, epoch, clientNonce }
+ *   The server cannot read `body`. `clientNonce` is required because it is part
+ *   of the ciphertext's authenticated data: the message only decrypts in this
+ *   room, from this sender, under this id.
+ *
+ * Once a private room has carried an encrypted message, the server refuses
+ * plaintext into it, so a stale client cannot quietly downgrade the room.
  */
 export async function POST(request: Request, context: { params: Promise<{ roomId: string }> }) {
   const user = await getCurrentUser();
@@ -75,24 +88,70 @@ export async function POST(request: Request, context: { params: Promise<{ roomId
   const payload = await readJson(request);
   if (!payload) return jsonError(400, 'Expected a JSON body');
 
-  const body = validateMessageBody(payload.body);
-  if (!body.ok) return jsonError(400, body.error, body.field);
+  const encVersion = payload.encVersion === 1 ? 1 : 0;
+  let body: string;
+  let iv: string | null = null;
+  let epoch: string | null = null;
+  let clientNonce: string | null;
 
-  const clientNonce = asString(payload.clientNonce).slice(0, 64) || null;
+  if (encVersion === 1) {
+    if (!isBase64Url(payload.body, 16, MAX_CIPHERTEXT_LENGTH)) {
+      return jsonError(400, 'Encrypted message is malformed or too long', 'body');
+    }
+    if (typeof payload.iv !== 'string' || !IV_PATTERN.test(payload.iv)) {
+      return jsonError(400, 'Encrypted message is missing its IV', 'iv');
+    }
+    if (typeof payload.epoch !== 'string' || !EPOCH_PATTERN.test(payload.epoch)) {
+      return jsonError(400, 'Encrypted message is missing its epoch', 'epoch');
+    }
+    if (typeof payload.clientNonce !== 'string' || !NONCE_PATTERN.test(payload.clientNonce)) {
+      return jsonError(400, 'Encrypted message needs a client nonce', 'clientNonce');
+    }
+    body = payload.body;
+    iv = payload.iv;
+    epoch = payload.epoch;
+    clientNonce = payload.clientNonce;
+  } else {
+    const validated = validateMessageBody(payload.body);
+    if (!validated.ok) return jsonError(400, validated.error, validated.field);
+    body = validated.value;
+    clientNonce = asString(payload.clientNonce).slice(0, 64) || null;
+  }
 
   try {
     const store = getStore();
     const room = await loadRoomFor(user, roomId);
     if (!room) return jsonError(404, 'Room not found');
 
+    if (room.kind === 'public' && encVersion === 1) {
+      return jsonError(400, 'Public rooms are not end-to-end encrypted');
+    }
+
+    if (room.kind === 'dm') {
+      const other = await counterpartOf(room, user.id);
+      // loadRoomFor already hid the room from someone who was blocked; this
+      // stops the person who did the blocking from continuing to send.
+      if (other && (await getSocial().isBlockedEitherWay(user.id, other.id))) {
+        return jsonError(403, 'You blocked this person. Unblock them to send messages.');
+      }
+      if (encVersion === 0 && room.e2eeSinceId !== null) {
+        return jsonError(
+          409,
+          'This conversation is end-to-end encrypted. Reload the page to send securely.',
+        );
+      }
+    }
+
     const message = await store.createMessage({
       roomId: room.id,
       userId: user.id,
-      body: body.value,
+      body,
       clientNonce,
+      encVersion,
+      iv,
+      epoch,
     });
 
-    // Sending implies presence, and it clears any lingering typing indicator.
     await Promise.all([
       store.touchPresence(room.id, user.id),
       store.setTyping(room.id, user.id, false),
@@ -100,6 +159,9 @@ export async function POST(request: Request, context: { params: Promise<{ roomId
 
     return NextResponse.json({ message }, { status: 201 });
   } catch (error) {
+    if (error instanceof NonceConflictError) {
+      return jsonError(409, 'Message id collision. Try sending again.');
+    }
     console.error('[messages:POST]', error);
     return jsonError(500, 'Could not send the message');
   }

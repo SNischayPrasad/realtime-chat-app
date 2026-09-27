@@ -1,3 +1,4 @@
+import { getSocial } from './social';
 import { getStore } from './store';
 import type { PublicUser, Room } from './types';
 
@@ -23,5 +24,19 @@ export async function loadRoomFor(user: PublicUser, idOrSlug: string): Promise<R
   // state - they are never consulted for authorization here.
   if (room.kind === 'public') return room;
 
-  return (await store.isRoomMember(room.id, user.id)) ? room : null;
+  if (!(await store.isRoomMember(room.id, user.id))) return null;
+
+  // If the other participant has blocked you, the conversation disappears for
+  // you exactly as if it did not exist - history, stream, typing, calls. The
+  // blocker keeps read access to their own history.
+  if (await getSocial().blockedInRoom(room.id, user.id)) return null;
+
+  return room;
+}
+
+/** The other participant of a DM, from membership - never from request input. */
+export async function counterpartOf(room: Room, userId: string): Promise<PublicUser | null> {
+  if (room.kind !== 'dm') return null;
+  const members = await getStore().listRoomMembers(room.id);
+  return members.find((member) => member.id !== userId) ?? null;
 }

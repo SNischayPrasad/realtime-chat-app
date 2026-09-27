@@ -4,9 +4,12 @@ import {
   STREAM_POLL_MS,
   STREAM_TTL_MS,
 } from '@/lib/config';
+import { getCalls } from '@/lib/calls';
 import { jsonError } from '@/lib/http';
 import { loadRoomFor } from '@/lib/rooms';
+import { getSocial } from '@/lib/social';
 import { getStore } from '@/lib/store';
+import type { PublicUser } from '@/lib/types';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -36,6 +39,18 @@ export const maxDuration = 60;
  * Access is resolved by `loadRoomFor`, so a stream can only ever be opened for
  * a public room or a private conversation the caller belongs to. In a private
  * conversation the roster is built from membership rather than presence.
+ *
+ * GET /api/stream?scope=user
+ *
+ * A second, user-scoped feed that is open whichever room is on screen. It
+ * carries what is addressed to YOU rather than to a room:
+ *   call    - an incoming call ringing, or a call you are in changing state
+ *   signal  - a sealed WebRTC signalling message for a call you are in
+ *             (carries `id:`, so a reconnect resumes without losing one)
+ *   social  - your friend-request count or friends list changed
+ * It takes no room id and does no room lookup: it only ever reads rows whose
+ * recipient is the session user, and authorization happened when they were
+ * written.
  */
 
 function frame(event: string, data: unknown, id?: string): string {
@@ -64,6 +79,8 @@ export async function GET(request: Request) {
   if (!user) return jsonError(401, 'You must be signed in to open a stream');
 
   const url = new URL(request.url);
+  if (url.searchParams.get('scope') === 'user') return userStream(request, user);
+
   const roomParam = url.searchParams.get('roomId');
   if (!roomParam) return jsonError(400, 'roomId is required');
 
@@ -215,4 +232,108 @@ export async function GET(request: Request) {
       'X-Accel-Buffering': 'no',
     },
   });
+}
+
+const STREAM_HEADERS = {
+  'Content-Type': 'text/event-stream; charset=utf-8',
+  'Cache-Control': 'no-cache, no-store, no-transform, must-revalidate',
+  Connection: 'keep-alive',
+  'X-Accel-Buffering': 'no',
+};
+
+/** See the `scope=user` notes at the top of this file. */
+function userStream(request: Request, user: PublicUser): Response {
+  const calls = getCalls();
+  const social = getSocial();
+  const encoder = new TextEncoder();
+  const deadline = Date.now() + STREAM_TTL_MS;
+
+  let cursor = request.headers.get('last-event-id') ?? '0';
+  if (!/^\d{1,19}$/.test(cursor)) cursor = '0';
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      let closed = false;
+      const send = (chunk: string) => {
+        if (closed) return;
+        try {
+          controller.enqueue(encoder.encode(chunk));
+        } catch {
+          closed = true;
+        }
+      };
+      const close = () => {
+        if (closed) return;
+        closed = true;
+        try {
+          controller.close();
+        } catch {
+          /* already closed */
+        }
+      };
+      request.signal.addEventListener('abort', close, { once: true });
+
+      send('retry: 1000\n\n');
+      send(frame('ready', { scope: 'user', cursor, pollMs: STREAM_POLL_MS }));
+
+      // Signals are re-read over a short recent window (see calls.ts), so the
+      // same row can come back twice; this set stops it being sent twice.
+      const sentSignals = new Set<string>();
+      const callSignatures = new Map<string, string>();
+      let socialSignature = '';
+      let lastSocialCheck = 0;
+      let lastHeartbeat = Date.now();
+      let tick = 0;
+
+      try {
+        while (!closed && !request.signal.aborted && Date.now() < deadline) {
+          const now = Date.now();
+          tick += 1;
+
+          if (tick % 15 === 1) await calls.reap();
+
+          for (const signal of await calls.signalsFor(user.id, cursor)) {
+            if (sentSignals.has(signal.id)) continue;
+            sentSignals.add(signal.id);
+            send(frame('signal', signal, signal.id));
+            if (Number(signal.id) > Number(cursor)) cursor = signal.id;
+          }
+
+          for (const call of await calls.liveCallsFor(user.id)) {
+            const signature = `${call.state}:${call.endReason ?? ''}`;
+            if (callSignatures.get(call.id) !== signature) {
+              callSignatures.set(call.id, signature);
+              send(frame('call', call));
+            }
+          }
+
+          if (now - lastSocialCheck > 3000) {
+            lastSocialCheck = now;
+            const revision = await social.revision(user.id);
+            const signature = `${revision.incoming}|${revision.rev}`;
+            if (signature !== socialSignature) {
+              socialSignature = signature;
+              send(frame('social', { incoming: revision.incoming, rev: revision.rev }));
+            }
+          }
+
+          if (now - lastHeartbeat > STREAM_HEARTBEAT_MS) {
+            lastHeartbeat = now;
+            send(`: heartbeat ${new Date(now).toISOString()}\n\n`);
+          }
+
+          await sleep(STREAM_POLL_MS, request.signal);
+        }
+
+        if (!closed && !request.signal.aborted) send(frame('reconnect', { cursor }));
+      } catch (error) {
+        console.error('[stream:user]', error);
+        send(frame('error', { message: 'The stream ended unexpectedly' }));
+      } finally {
+        close();
+      }
+    },
+  });
+
+  return new Response(stream, { headers: STREAM_HEADERS });
 }

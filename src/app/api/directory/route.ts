@@ -1,32 +1,72 @@
 import { NextResponse } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
-import { clampLimit, jsonError, unauthorized } from '@/lib/http';
+import { jsonError, unauthorized } from '@/lib/http';
+import { checkRateLimit, LIMITS } from '@/lib/ratelimit';
+import { getSocial } from '@/lib/social';
 import { getStore } from '@/lib/store';
+import type { DirectoryEntry, FriendEntry, FriendRelation } from '@/lib/types';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 /**
- * GET /api/directory?q=&limit=
+ * GET /api/directory?q= - backs the "add friend" and "new message" pickers.
  *
- * Backs the people picker. Signed-in only, the caller is excluded, results are
- * hard-capped, and the store selects an explicit column list so a password hash
- * can never ride along into the response.
- *
- * With no query it returns recently-present people rather than a dump of the
- * user table, so the common case is one click and zero typing while the default
- * response describes who is around rather than who exists.
+ * You see your own graph: friends and pending requests in either direction.
+ * A stranger appears only on an EXACT username match (3+ characters), one at a
+ * time, rate-limited. There is no prefix search over strangers and no "active
+ * recently" list: the first made the user table harvestable and the second
+ * told anyone who was online right now.
  */
 export async function GET(request: Request) {
   const user = await getCurrentUser();
   if (!user) return unauthorized();
 
   const url = new URL(request.url);
-  const q = (url.searchParams.get('q') ?? '').slice(0, 64);
-  const limit = clampLimit(url.searchParams.get('limit'), 15, 25);
+  const q = (url.searchParams.get('q') ?? '').trim().replace(/^@/, '').slice(0, 64).toLowerCase();
 
   try {
-    const people = await getStore().searchUsers({ q, limit, excludeUserId: user.id });
+    const social = getSocial();
+    const snapshot = await social.snapshot(user.id);
+
+    const tag = (entries: FriendEntry[], relation: FriendRelation): DirectoryEntry[] =>
+      entries.map((entry) => ({ ...entry.user, relation }));
+    const graph: DirectoryEntry[] = [
+      ...tag(snapshot.friends, 'friend'),
+      ...tag(snapshot.incoming, 'incoming'),
+      ...tag(snapshot.outgoing, 'outgoing'),
+    ];
+
+    const people = q
+      ? graph.filter(
+          (person) =>
+            person.username.toLowerCase().includes(q) ||
+            person.displayName.toLowerCase().includes(q),
+        )
+      : graph;
+
+    if (q.length >= 3 && !graph.some((person) => person.username.toLowerCase() === q)) {
+      const allowed = await checkRateLimit(
+        `lookup:${user.id}`,
+        LIMITS.lookupPerUser.limit,
+        LIMITS.lookupPerUser.windowSeconds,
+      );
+      if (allowed) {
+        const found = await getStore().findUserByUsername(q);
+        if (found && found.id !== user.id && !(await social.isBlockedEitherWay(user.id, found.id))) {
+          // Stripped to public fields only; never the auth or token versions.
+          people.push({
+            id: found.id,
+            username: found.username,
+            displayName: found.displayName,
+            avatarHue: found.avatarHue,
+            createdAt: found.createdAt,
+            relation: await social.relation(user.id, found.id),
+          });
+        }
+      }
+    }
+
     return NextResponse.json({ people });
   } catch (error) {
     console.error('[directory:GET]', error);

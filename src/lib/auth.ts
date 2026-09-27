@@ -44,7 +44,14 @@ export async function verifyPassword(password: string, stored: string): Promise<
 /* Session tokens                                                             */
 /* -------------------------------------------------------------------------- */
 
-type SessionPayload = { uid: string; exp: number };
+/**
+ * `tv` is the account's token version at issue time. Bumping `users.token_version`
+ * invalidates every outstanding cookie for that account on its next request -
+ * the only way to revoke what is otherwise a stateless, self-validating token.
+ * Cookies minted before this field existed carry no `tv` and read as 0, which
+ * matches the column default, so existing sessions survive the upgrade.
+ */
+type SessionPayload = { uid: string; exp: number; tv?: number };
 
 function base64url(input: Buffer | string): string {
   return Buffer.from(input)
@@ -59,8 +66,12 @@ function sign(payload: string): string {
 }
 
 /** `<base64url(json)>.<base64url(hmac)>` - a minimal signed cookie, no deps. */
-export function createSessionToken(userId: string): string {
-  const payload: SessionPayload = { uid: userId, exp: Date.now() + SESSION_TTL_MS };
+export function createSessionToken(userId: string, tokenVersion = 0): string {
+  const payload: SessionPayload = {
+    uid: userId,
+    exp: Date.now() + SESSION_TTL_MS,
+    tv: tokenVersion,
+  };
   const encoded = base64url(JSON.stringify(payload));
   return `${encoded}.${sign(encoded)}`;
 }
@@ -80,6 +91,7 @@ export function readSessionToken(token: string | undefined): SessionPayload | nu
       Buffer.from(encoded.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'),
     ) as SessionPayload;
     if (typeof payload.uid !== 'string' || typeof payload.exp !== 'number') return null;
+    if (payload.tv !== undefined && typeof payload.tv !== 'number') return null;
     if (payload.exp < Date.now()) return null;
     return payload;
   } catch {
@@ -99,12 +111,19 @@ export const sessionCookieOptions = {
 /* Request helpers                                                            */
 /* -------------------------------------------------------------------------- */
 
+/** Looks the user up and rejects a cookie whose token version was revoked. */
+async function resolveSession(payload: SessionPayload | null): Promise<PublicUser | null> {
+  if (!payload) return null;
+  const session = await getStore().findSessionUser(payload.uid);
+  if (!session) return null;
+  if ((payload.tv ?? 0) !== session.tokenVersion) return null;
+  return session.user;
+}
+
 /** Resolves the signed-in user from the request cookies, or null. */
 export async function getCurrentUser(): Promise<PublicUser | null> {
   const cookieStore = await cookies();
-  const payload = readSessionToken(cookieStore.get(SESSION_COOKIE)?.value);
-  if (!payload) return null;
-  return getStore().findUserById(payload.uid);
+  return resolveSession(readSessionToken(cookieStore.get(SESSION_COOKIE)?.value));
 }
 
 /** Same as {@link getCurrentUser} but reads the cookie off a `Request`. */
@@ -116,7 +135,7 @@ export async function getUserFromRequest(request: Request): Promise<PublicUser |
     .map((part) => part.trim())
     .find((part) => part.startsWith(`${SESSION_COOKIE}=`));
   if (!match) return null;
-  const payload = readSessionToken(decodeURIComponent(match.slice(SESSION_COOKIE.length + 1)));
-  if (!payload) return null;
-  return getStore().findUserById(payload.uid);
+  return resolveSession(
+    readSessionToken(decodeURIComponent(match.slice(SESSION_COOKIE.length + 1))),
+  );
 }

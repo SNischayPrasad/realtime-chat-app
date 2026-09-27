@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { MAX_MESSAGE_LENGTH } from './config';
+import type { NewKeys, SealedBlob } from './types';
 
 export type ApiError = { error: string; field?: string };
 
@@ -87,4 +88,60 @@ export function clampLimit(raw: string | null, fallback: number, max: number): n
   const parsed = Number.parseInt(raw ?? '', 10);
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
   return Math.min(parsed, max);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Encryption-era validators                                                  */
+/* -------------------------------------------------------------------------- */
+
+const BASE64URL = /^[A-Za-z0-9_-]+$/;
+
+export function isBase64Url(value: unknown, minLength: number, maxLength: number): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length >= minLength &&
+    value.length <= maxLength &&
+    BASE64URL.test(value)
+  );
+}
+
+/**
+ * The client sends a 64-hex-character secret derived from the password, never
+ * the password itself. Also catches an outdated client posting a raw password.
+ */
+export const AUTH_SECRET_PATTERN = /^[0-9a-f]{64}$/;
+
+/** A 12-byte AES-GCM IV, base64url-encoded without padding. */
+export const IV_PATTERN = /^[A-Za-z0-9_-]{16}$/;
+
+/** First four bytes of a SHA-256, hex. */
+export const EPOCH_PATTERN = /^[0-9a-f]{8}$/;
+
+/** Client nonces are an AAD input for encrypted messages, so they are strict. */
+export const NONCE_PATTERN = /^[A-Za-z0-9_-]{16,64}$/;
+
+const MAX_VAULT_LENGTH = 64_000;
+
+export function parseSealed(value: unknown): SealedBlob | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const { ct, iv } = value as Record<string, unknown>;
+  if (!isBase64Url(ct, 16, MAX_VAULT_LENGTH) || typeof iv !== 'string' || !IV_PATTERN.test(iv)) {
+    return null;
+  }
+  return { ct, iv };
+}
+
+/** Validates the key material a client submits at registration or upgrade. */
+export function parseNewKeys(body: Record<string, unknown>): NewKeys | null {
+  const { vaultId, identityPub } = body;
+  if (!isBase64Url(vaultId, 16, 64)) return null;
+  // A P-256 SPKI is 91 bytes, which is 122 base64url characters.
+  if (!isBase64Url(identityPub, 100, 200)) return null;
+  const vault = parseSealed(body.vault);
+  if (!vault) return null;
+  const recovery = body.recovery === undefined || body.recovery === null
+    ? null
+    : parseSealed(body.recovery);
+  if (body.recovery && !recovery) return null;
+  return { vaultId, identityPub, vault, recovery };
 }

@@ -2,13 +2,19 @@ import { randomUUID } from 'node:crypto';
 import { HAS_DATABASE, PRESENCE_WINDOW_MS, TYPING_TTL_MS } from './config';
 import { isUniqueViolation, query, withTransaction } from './db';
 import {
+  NonceConflictError,
   RoomExistsError,
   UsernameTakenError,
   type Conversation,
+  type ConversationPreview,
+  type EncVersion,
+  type KeyBundle,
   type Message,
+  type NewKeys,
   type PresenceEntry,
   type PublicUser,
   type Room,
+  type SealedBlob,
   type UserRecord,
 } from './types';
 
@@ -24,26 +30,45 @@ export type CreateMessageInput = {
   userId: string;
   body: string;
   clientNonce?: string | null;
+  encVersion?: EncVersion;
+  iv?: string | null;
+  epoch?: string | null;
 };
 
-export type UserSearchOptions = {
-  q: string;
-  limit: number;
-  excludeUserId: string;
+export type NewAccount = {
+  username: string;
+  displayName: string;
+  /** scrypt(authSecret) - the server never sees the password itself. */
+  passwordHash: string;
+  avatarHue: number;
+  keys: NewKeys;
 };
 
 export interface ChatStore {
   readonly kind: 'postgres' | 'memory';
 
-  createUser(input: {
-    username: string;
-    displayName: string;
-    passwordHash: string;
-    avatarHue: number;
-  }): Promise<PublicUser>;
+  /** Creates the user AND their key vault atomically: an account must never exist without one. */
+  createAccount(input: NewAccount): Promise<PublicUser>;
   findUserByUsername(username: string): Promise<UserRecord | null>;
   findUserById(id: string): Promise<PublicUser | null>;
-  searchUsers(options: UserSearchOptions): Promise<PublicUser[]>;
+  /** The user plus the token version their session cookie must match. */
+  findSessionUser(id: string): Promise<{ user: PublicUser; tokenVersion: number } | null>;
+
+  getKeyBundle(userId: string): Promise<KeyBundle | null>;
+  /** Identity public keys for the given users; users without keys are omitted. */
+  getIdentityKeys(userIds: string[]): Promise<Record<string, string>>;
+  /**
+   * Second half of the legacy-account upgrade. Only succeeds for an account
+   * still at auth_version 0, so two racing tabs cannot strand a vault under
+   * the wrong key.
+   */
+  bootstrapKeys(
+    userId: string,
+    passwordHash: string,
+    keys: NewKeys,
+  ): Promise<{ upgraded: boolean; tokenVersion: number }>;
+  /** Optimistic write: succeeds only if the stored version is `version - 1`. */
+  updateVault(userId: string, vault: SealedBlob, version: number): Promise<boolean>;
 
   /** Public rooms only. DMs are never returned here - see listConversations. */
   listRooms(): Promise<Room[]>;
@@ -53,6 +78,7 @@ export interface ChatStore {
   /** Membership is authoritative for `dm` rooms only. */
   isRoomMember(roomId: string, userId: string): Promise<boolean>;
   listRoomMembers(roomId: string): Promise<PublicUser[]>;
+  findDirectRoom(userIdA: string, userIdB: string): Promise<Room | null>;
   findOrCreateDirectRoom(
     userIdA: string,
     userIdB: string,
@@ -95,6 +121,7 @@ export function hueFor(value: string): number {
  * unique index on `rooms.dm_key` collapses the race into one room.
  *
  * Built from user ids rather than usernames so it survives a future rename.
+ * The e2ee layer computes the same value independently on each client.
  */
 export function directKey(userIdA: string, userIdB: string): string {
   return [userIdA, userIdB].sort().join('|');
@@ -115,11 +142,6 @@ function preview(body: string): string {
   return body.length > PREVIEW_LENGTH ? `${body.slice(0, PREVIEW_LENGTH)}…` : body;
 }
 
-/** Escapes LIKE metacharacters so a search for "100%" is not a wildcard. */
-function escapeLike(value: string): string {
-  return value.replace(/[\\%_]/g, (match) => `\\${match}`);
-}
-
 /* -------------------------------------------------------------------------- */
 /* Postgres implementation                                                    */
 /* -------------------------------------------------------------------------- */
@@ -131,9 +153,11 @@ type UserRow = {
   password_hash: string;
   avatar_hue: number;
   created_at: Date;
+  auth_version: number;
+  token_version: number;
 };
 
-type PublicUserRow = Omit<UserRow, 'password_hash'>;
+type PublicUserRow = Pick<UserRow, 'id' | 'username' | 'display_name' | 'avatar_hue' | 'created_at'>;
 
 type RoomRow = {
   id: string;
@@ -143,6 +167,7 @@ type RoomRow = {
   kind: string;
   created_by: string | null;
   created_at: Date;
+  e2ee_since_id: string | null;
 };
 
 type MessageRow = {
@@ -150,6 +175,10 @@ type MessageRow = {
   room_id: string;
   body: string;
   created_at: Date;
+  client_nonce: string | null;
+  enc_version: number;
+  enc_iv: string | null;
+  enc_epoch: string | null;
   user_id: string;
   username: string;
   display_name: string;
@@ -171,11 +200,25 @@ type ConversationRow = RoomRow & {
   o_display_name: string;
   o_avatar_hue: number;
   o_created_at: Date;
+  o_identity_pub: string | null;
   lm_id: string | null;
   lm_body: string | null;
   lm_created_at: Date | null;
   lm_author: string | null;
+  lm_client_nonce: string | null;
+  lm_enc_version: number | null;
+  lm_enc_iv: string | null;
+  lm_enc_epoch: string | null;
   unread: string;
+};
+
+type KeyRow = {
+  vault_id: string;
+  identity_pub: string;
+  vault_ct: string;
+  vault_iv: string;
+  vault_version: number;
+  recovery_ct: string | null;
 };
 
 function toPublicUser(row: PublicUserRow): PublicUser {
@@ -197,7 +240,12 @@ function toRoom(row: RoomRow): Room {
     kind: row.kind === 'dm' ? 'dm' : 'public',
     createdBy: row.created_by,
     createdAt: row.created_at.toISOString(),
+    e2eeSinceId: row.e2ee_since_id === null ? null : String(row.e2ee_since_id),
   };
+}
+
+function toEncVersion(value: number | null | undefined): EncVersion {
+  return value === 1 ? 1 : 0;
 }
 
 function toMessage(row: MessageRow): Message {
@@ -213,6 +261,10 @@ function toMessage(row: MessageRow): Message {
       avatarHue: row.avatar_hue,
       createdAt: row.user_created_at.toISOString(),
     },
+    clientNonce: row.client_nonce,
+    encVersion: toEncVersion(row.enc_version),
+    iv: row.enc_iv,
+    epoch: row.enc_epoch,
   };
 }
 
@@ -226,8 +278,18 @@ function toPresence(row: PresenceRow): PresenceEntry {
   };
 }
 
+function toKeyBundle(row: KeyRow): KeyBundle {
+  return {
+    vaultId: row.vault_id,
+    identityPub: row.identity_pub,
+    vault: { ct: row.vault_ct, iv: row.vault_iv, version: row.vault_version },
+    recoveryAvailable: row.recovery_ct !== null,
+  };
+}
+
 const MESSAGE_SELECT = `
   SELECT m.id, m.room_id, m.body, m.created_at,
+         m.client_nonce, m.enc_version, m.enc_iv, m.enc_epoch,
          u.id AS user_id, u.username, u.display_name, u.avatar_hue,
          u.created_at AS user_created_at
   FROM messages m
@@ -240,28 +302,42 @@ const USER_COLUMNS = 'id, username, display_name, avatar_hue, created_at';
 class PostgresStore implements ChatStore {
   readonly kind = 'postgres' as const;
 
-  async createUser(input: {
-    username: string;
-    displayName: string;
-    passwordHash: string;
-    avatarHue: number;
-  }): Promise<PublicUser> {
+  async createAccount(input: NewAccount): Promise<PublicUser> {
     const id = `usr_${randomUUID().replace(/-/g, '')}`;
     try {
-      const rows = await query<UserRow>(
-        `INSERT INTO users (id, username, username_lower, display_name, password_hash, avatar_hue)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         RETURNING *`,
-        [
-          id,
-          input.username,
-          input.username.toLowerCase(),
-          input.displayName,
-          input.passwordHash,
-          input.avatarHue,
-        ],
-      );
-      return toPublicUser(rows[0]);
+      return await withTransaction(async (client) => {
+        const inserted = await client.query<UserRow>(
+          `INSERT INTO users
+             (id, username, username_lower, display_name, password_hash, avatar_hue, auth_version)
+           VALUES ($1, $2, $3, $4, $5, $6, 1)
+           RETURNING ${USER_COLUMNS}`,
+          [
+            id,
+            input.username,
+            input.username.toLowerCase(),
+            input.displayName,
+            input.passwordHash,
+            input.avatarHue,
+          ],
+        );
+        await client.query(
+          `INSERT INTO user_keys
+             (user_id, vault_id, identity_pub, vault_ct, vault_iv, vault_version,
+              recovery_ct, recovery_iv, recovery_version)
+           VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8)`,
+          [
+            id,
+            input.keys.vaultId,
+            input.keys.identityPub,
+            input.keys.vault.ct,
+            input.keys.vault.iv,
+            input.keys.recovery?.ct ?? null,
+            input.keys.recovery?.iv ?? null,
+            input.keys.recovery ? 1 : 0,
+          ],
+        );
+        return toPublicUser(inserted.rows[0]);
+      });
     } catch (error) {
       if (isUniqueViolation(error)) throw new UsernameTakenError(input.username);
       throw error;
@@ -269,11 +345,18 @@ class PostgresStore implements ChatStore {
   }
 
   async findUserByUsername(username: string): Promise<UserRecord | null> {
-    const rows = await query<UserRow>('SELECT * FROM users WHERE username_lower = $1', [
-      username.toLowerCase(),
-    ]);
+    const rows = await query<UserRow>(
+      `SELECT ${USER_COLUMNS}, password_hash, auth_version, token_version
+       FROM users WHERE username_lower = $1`,
+      [username.toLowerCase()],
+    );
     if (rows.length === 0) return null;
-    return { ...toPublicUser(rows[0]), passwordHash: rows[0].password_hash };
+    return {
+      ...toPublicUser(rows[0]),
+      passwordHash: rows[0].password_hash,
+      authVersion: rows[0].auth_version,
+      tokenVersion: rows[0].token_version,
+    };
   }
 
   async findUserById(id: string): Promise<PublicUser | null> {
@@ -281,40 +364,83 @@ class PostgresStore implements ChatStore {
     return rows.length ? toPublicUser(rows[0]) : null;
   }
 
-  async searchUsers(options: UserSearchOptions): Promise<PublicUser[]> {
-    const q = options.q.trim();
-    if (!q) {
-      // No query: show whoever has been active recently, so the picker is
-      // useful with zero typing rather than dumping the whole user table.
-      const rows = await query<PublicUserRow>(
-        `SELECT ${USER_COLUMNS.split(', ')
-          .map((column) => `u.${column}`)
-          .join(', ')}
-         FROM users u
-         JOIN (
-           SELECT user_id, MAX(last_seen_at) AS seen FROM presence GROUP BY user_id
-         ) p ON p.user_id = u.id
-         WHERE u.id <> $1 AND p.seen > now() - ($2::int * INTERVAL '1 millisecond')
-         ORDER BY p.seen DESC
-         LIMIT $3`,
-        [options.excludeUserId, PRESENCE_WINDOW_MS * 40, options.limit],
-      );
-      return rows.map(toPublicUser);
-    }
-
-    const pattern = `${escapeLike(q.toLowerCase())}%`;
-    const contains = `%${escapeLike(q.toLowerCase())}%`;
-    const rows = await query<PublicUserRow>(
-      `SELECT ${USER_COLUMNS} FROM users
-       WHERE id <> $1
-         AND (username_lower LIKE $3 ESCAPE '\\' OR lower(display_name) LIKE $3 ESCAPE '\\')
-       ORDER BY
-         (username_lower LIKE $2 ESCAPE '\\' OR lower(display_name) LIKE $2 ESCAPE '\\') DESC,
-         username_lower ASC
-       LIMIT $4`,
-      [options.excludeUserId, pattern, contains, options.limit],
+  async findSessionUser(id: string): Promise<{ user: PublicUser; tokenVersion: number } | null> {
+    const rows = await query<UserRow>(
+      `SELECT ${USER_COLUMNS}, token_version FROM users WHERE id = $1`,
+      [id],
     );
-    return rows.map(toPublicUser);
+    if (rows.length === 0) return null;
+    return { user: toPublicUser(rows[0]), tokenVersion: rows[0].token_version };
+  }
+
+  async getKeyBundle(userId: string): Promise<KeyBundle | null> {
+    const rows = await query<KeyRow>(
+      `SELECT vault_id, identity_pub, vault_ct, vault_iv, vault_version, recovery_ct
+       FROM user_keys WHERE user_id = $1`,
+      [userId],
+    );
+    return rows.length ? toKeyBundle(rows[0]) : null;
+  }
+
+  async getIdentityKeys(userIds: string[]): Promise<Record<string, string>> {
+    if (userIds.length === 0) return {};
+    const rows = await query<{ user_id: string; identity_pub: string }>(
+      'SELECT user_id, identity_pub FROM user_keys WHERE user_id = ANY($1::text[])',
+      [userIds],
+    );
+    return Object.fromEntries(rows.map((row) => [row.user_id, row.identity_pub]));
+  }
+
+  async bootstrapKeys(
+    userId: string,
+    passwordHash: string,
+    keys: NewKeys,
+  ): Promise<{ upgraded: boolean; tokenVersion: number }> {
+    return withTransaction(async (client) => {
+      const updated = await client.query<{ token_version: number }>(
+        `UPDATE users
+         SET password_hash = $2, auth_version = 1, token_version = token_version + 1
+         WHERE id = $1 AND auth_version = 0
+         RETURNING token_version`,
+        [userId, passwordHash],
+      );
+      if (updated.rowCount === 0) {
+        const current = await client.query<{ token_version: number }>(
+          'SELECT token_version FROM users WHERE id = $1',
+          [userId],
+        );
+        return { upgraded: false, tokenVersion: current.rows[0]?.token_version ?? 0 };
+      }
+      await client.query(
+        `INSERT INTO user_keys
+           (user_id, vault_id, identity_pub, vault_ct, vault_iv, vault_version,
+            recovery_ct, recovery_iv, recovery_version)
+         VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8)
+         ON CONFLICT (user_id) DO NOTHING`,
+        [
+          userId,
+          keys.vaultId,
+          keys.identityPub,
+          keys.vault.ct,
+          keys.vault.iv,
+          keys.recovery?.ct ?? null,
+          keys.recovery?.iv ?? null,
+          keys.recovery ? 1 : 0,
+        ],
+      );
+      return { upgraded: true, tokenVersion: updated.rows[0].token_version };
+    });
+  }
+
+  async updateVault(userId: string, vault: SealedBlob, version: number): Promise<boolean> {
+    const rows = await query(
+      `UPDATE user_keys
+       SET vault_ct = $2, vault_iv = $3, vault_version = $4, updated_at = now()
+       WHERE user_id = $1 AND vault_version = $4 - 1
+       RETURNING 1`,
+      [userId, vault.ct, vault.iv, version],
+    );
+    return rows.length > 0;
   }
 
   async listRooms(): Promise<Room[]> {
@@ -370,6 +496,13 @@ class PostgresStore implements ChatStore {
     return rows.map(toPublicUser);
   }
 
+  async findDirectRoom(userIdA: string, userIdB: string): Promise<Room | null> {
+    const rows = await query<RoomRow>('SELECT * FROM rooms WHERE dm_key = $1', [
+      directKey(userIdA, userIdB),
+    ]);
+    return rows.length ? toRoom(rows[0]) : null;
+  }
+
   async findOrCreateDirectRoom(
     userIdA: string,
     userIdB: string,
@@ -413,15 +546,20 @@ class PostgresStore implements ChatStore {
       `SELECT r.*,
               o.id AS o_id, o.username AS o_username, o.display_name AS o_display_name,
               o.avatar_hue AS o_avatar_hue, o.created_at AS o_created_at,
+              k.identity_pub AS o_identity_pub,
               lm.id AS lm_id, lm.body AS lm_body,
               lm.created_at AS lm_created_at, lm.user_id AS lm_author,
+              lm.client_nonce AS lm_client_nonce, lm.enc_version AS lm_enc_version,
+              lm.enc_iv AS lm_enc_iv, lm.enc_epoch AS lm_enc_epoch,
               COALESCE(uc.cnt, 0) AS unread
        FROM room_members me
        JOIN rooms r ON r.id = me.room_id AND r.kind = 'dm'
        JOIN room_members other ON other.room_id = r.id AND other.user_id <> me.user_id
        JOIN users o ON o.id = other.user_id
+       LEFT JOIN user_keys k ON k.user_id = o.id
        LEFT JOIN LATERAL (
-         SELECT m.id, m.body, m.created_at, m.user_id
+         SELECT m.id, m.body, m.created_at, m.user_id,
+                m.client_nonce, m.enc_version, m.enc_iv, m.enc_epoch
          FROM messages m WHERE m.room_id = r.id ORDER BY m.id DESC LIMIT 1
        ) lm ON TRUE
        LEFT JOIN LATERAL (
@@ -433,25 +571,36 @@ class PostgresStore implements ChatStore {
       [userId],
     );
 
-    return rows.map((row) => ({
-      room: toRoom(row),
-      counterpart: toPublicUser({
-        id: row.o_id,
-        username: row.o_username,
-        display_name: row.o_display_name,
-        avatar_hue: row.o_avatar_hue,
-        created_at: row.o_created_at,
-      }),
-      lastMessage: row.lm_id
-        ? {
-            id: String(row.lm_id),
-            body: preview(row.lm_body ?? ''),
-            createdAt: (row.lm_created_at as Date).toISOString(),
-            authorId: row.lm_author as string,
-          }
-        : null,
-      unreadCount: Number(row.unread),
-    }));
+    return rows.map((row) => {
+      let lastMessage: ConversationPreview | null = null;
+      if (row.lm_id) {
+        const encVersion = toEncVersion(row.lm_enc_version);
+        lastMessage = {
+          id: String(row.lm_id),
+          // Ciphertext is returned whole: truncating it would cut the GCM tag.
+          body: encVersion === 1 ? (row.lm_body ?? '') : preview(row.lm_body ?? ''),
+          createdAt: (row.lm_created_at as Date).toISOString(),
+          authorId: row.lm_author as string,
+          clientNonce: row.lm_client_nonce,
+          encVersion,
+          iv: row.lm_enc_iv,
+          epoch: row.lm_enc_epoch,
+        };
+      }
+      return {
+        room: toRoom(row),
+        counterpart: toPublicUser({
+          id: row.o_id,
+          username: row.o_username,
+          display_name: row.o_display_name,
+          avatar_hue: row.o_avatar_hue,
+          created_at: row.o_created_at,
+        }),
+        counterpartKey: row.o_identity_pub,
+        lastMessage,
+        unreadCount: Number(row.unread),
+      };
+    });
   }
 
   async markRead(roomId: string, userId: string, lastReadId: string): Promise<void> {
@@ -490,37 +639,57 @@ class PostgresStore implements ChatStore {
   }
 
   async createMessage(input: CreateMessageInput): Promise<Message> {
+    const encVersion = input.encVersion ?? 0;
     const inserted = await query<{ id: string }>(
-      `INSERT INTO messages (room_id, user_id, body, client_nonce)
-       VALUES ($1, $2, $3, $4)
+      `INSERT INTO messages (room_id, user_id, body, client_nonce, enc_version, enc_iv, enc_epoch)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
        ON CONFLICT (user_id, client_nonce) WHERE client_nonce IS NOT NULL DO NOTHING
        RETURNING id`,
-      [input.roomId, input.userId, input.body, input.clientNonce ?? null],
+      [
+        input.roomId,
+        input.userId,
+        input.body,
+        input.clientNonce ?? null,
+        encVersion,
+        input.iv ?? null,
+        input.epoch ?? null,
+      ],
     );
 
-    // Nothing returned means the unique nonce index swallowed a retry; look up
-    // the row that already exists so the caller still gets the message back.
-    // Scoped to this room so a nonce replayed against a different room cannot
-    // read back a message from the first one.
-    const id = inserted.length
-      ? inserted[0].id
-      : (
-          await query<{ id: string }>(
-            'SELECT id FROM messages WHERE user_id = $1 AND client_nonce = $2 AND room_id = $3',
-            [input.userId, input.clientNonce, input.roomId],
-          )
-        )[0]?.id;
+    let id: string | undefined = inserted[0]?.id;
 
     if (!id) {
-      // The nonce belongs to a message in another room. Treat it as a fresh
-      // send rather than leaking or duplicating anything.
-      const fresh = await query<{ id: string }>(
-        `INSERT INTO messages (room_id, user_id, body, client_nonce)
-         VALUES ($1, $2, $3, NULL) RETURNING id`,
-        [input.roomId, input.userId, input.body],
+      // The unique nonce index swallowed a retry; look up the row that already
+      // exists so the caller still gets the message back. Scoped to this room
+      // so a nonce replayed against a different room cannot read back a
+      // message from the first one.
+      id = (
+        await query<{ id: string }>(
+          'SELECT id FROM messages WHERE user_id = $1 AND client_nonce = $2 AND room_id = $3',
+          [input.userId, input.clientNonce, input.roomId],
+        )
+      )[0]?.id;
+
+      if (!id) {
+        // The nonce belongs to a message in another room. For an encrypted
+        // message the nonce is part of the authenticated data, so storing it
+        // without one would make it undecryptable - refuse instead.
+        if (encVersion === 1) throw new NonceConflictError();
+        const fresh = await query<{ id: string }>(
+          `INSERT INTO messages (room_id, user_id, body, client_nonce)
+           VALUES ($1, $2, $3, NULL) RETURNING id`,
+          [input.roomId, input.userId, input.body],
+        );
+        id = fresh[0].id;
+      }
+    } else if (encVersion === 1) {
+      // Mark where encryption began. LEAST keeps the earliest of two racing
+      // first messages rather than whichever UPDATE happened to run first.
+      await query(
+        `UPDATE rooms SET e2ee_since_id = LEAST(COALESCE(e2ee_since_id, $2), $2)
+         WHERE id = $1`,
+        [input.roomId, id],
       );
-      const rows = await query<MessageRow>(`${MESSAGE_SELECT} WHERE m.id = $1`, [fresh[0].id]);
-      return toMessage(rows[0]);
     }
 
     const rows = await query<MessageRow>(`${MESSAGE_SELECT} WHERE m.id = $1`, [id]);
@@ -578,8 +747,16 @@ class PostgresStore implements ChatStore {
 /* In-memory implementation (local development only)                          */
 /* -------------------------------------------------------------------------- */
 
+type StoredKeys = {
+  vaultId: string;
+  identityPub: string;
+  vault: SealedBlob & { version: number };
+  recovery: SealedBlob | null;
+};
+
 type MemoryState = {
   users: Map<string, UserRecord>;
+  keys: Map<string, StoredKeys>;
   rooms: Map<string, Room>;
   dmKeys: Map<string, string>;
   members: Map<string, Map<string, { joinedAt: number; lastReadId: number }>>;
@@ -595,7 +772,7 @@ declare global {
   var __chatMemoryState: MemoryState | undefined;
 }
 
-function memoryState(): MemoryState {
+export function memoryState(): MemoryState {
   if (!global.__chatMemoryState) {
     const rooms = new Map<string, Room>();
     const now = new Date().toISOString();
@@ -609,10 +786,17 @@ function memoryState(): MemoryState {
       },
       { id: 'room_random', slug: 'random', name: 'Random', topic: 'Off-topic chatter' },
     ]) {
-      rooms.set(seed.id, { ...seed, kind: 'public', createdBy: null, createdAt: now });
+      rooms.set(seed.id, {
+        ...seed,
+        kind: 'public',
+        createdBy: null,
+        createdAt: now,
+        e2eeSinceId: null,
+      });
     }
     global.__chatMemoryState = {
       users: new Map(),
+      keys: new Map(),
       rooms,
       dmKeys: new Map(),
       members: new Map(),
@@ -626,16 +810,32 @@ function memoryState(): MemoryState {
   return global.__chatMemoryState;
 }
 
+function publicOf(user: UserRecord): PublicUser {
+  return {
+    id: user.id,
+    username: user.username,
+    displayName: user.displayName,
+    avatarHue: user.avatarHue,
+    createdAt: user.createdAt,
+  };
+}
+
+function bundleOf(keys: StoredKeys): KeyBundle {
+  return {
+    vaultId: keys.vaultId,
+    identityPub: keys.identityPub,
+    vault: keys.vault,
+    recoveryAvailable: keys.recovery !== null,
+  };
+}
+
 class MemoryStore implements ChatStore {
   readonly kind = 'memory' as const;
 
-  async createUser(input: {
-    username: string;
-    displayName: string;
-    passwordHash: string;
-    avatarHue: number;
-  }): Promise<PublicUser> {
+  async createAccount(input: NewAccount): Promise<PublicUser> {
     const state = memoryState();
+    // No await before the writes below: on Node's single-threaded loop the
+    // check and both inserts are atomic, standing in for the SQL transaction.
     for (const user of state.users.values()) {
       if (user.username.toLowerCase() === input.username.toLowerCase()) {
         throw new UsernameTakenError(input.username);
@@ -648,10 +848,17 @@ class MemoryStore implements ChatStore {
       avatarHue: input.avatarHue,
       createdAt: new Date().toISOString(),
       passwordHash: input.passwordHash,
+      authVersion: 1,
+      tokenVersion: 0,
     };
     state.users.set(record.id, record);
-    const { passwordHash: _ignored, ...publicUser } = record;
-    return publicUser;
+    state.keys.set(record.id, {
+      vaultId: input.keys.vaultId,
+      identityPub: input.keys.identityPub,
+      vault: { ...input.keys.vault, version: 1 },
+      recovery: input.keys.recovery,
+    });
+    return publicOf(record);
   }
 
   async findUserByUsername(username: string): Promise<UserRecord | null> {
@@ -663,48 +870,57 @@ class MemoryStore implements ChatStore {
 
   async findUserById(id: string): Promise<PublicUser | null> {
     const user = memoryState().users.get(id);
-    if (!user) return null;
-    const { passwordHash: _ignored, ...publicUser } = user;
-    return publicUser;
+    return user ? publicOf(user) : null;
   }
 
-  async searchUsers(options: UserSearchOptions): Promise<PublicUser[]> {
+  async findSessionUser(id: string): Promise<{ user: PublicUser; tokenVersion: number } | null> {
+    const user = memoryState().users.get(id);
+    return user ? { user: publicOf(user), tokenVersion: user.tokenVersion } : null;
+  }
+
+  async getKeyBundle(userId: string): Promise<KeyBundle | null> {
+    const keys = memoryState().keys.get(userId);
+    return keys ? bundleOf(keys) : null;
+  }
+
+  async getIdentityKeys(userIds: string[]): Promise<Record<string, string>> {
     const state = memoryState();
-    const q = options.q.trim().toLowerCase();
-    const candidates: PublicUser[] = [];
-    for (const user of state.users.values()) {
-      if (user.id === options.excludeUserId) continue;
-      const { passwordHash: _ignored, ...publicUser } = user;
-      candidates.push(publicUser);
+    const out: Record<string, string> = {};
+    for (const id of userIds) {
+      const keys = state.keys.get(id);
+      if (keys) out[id] = keys.identityPub;
     }
+    return out;
+  }
 
-    if (!q) {
-      const seen = new Map<string, number>();
-      for (const [key, timestamp] of state.presence.entries()) {
-        const userId = key.split(':')[1];
-        seen.set(userId, Math.max(seen.get(userId) ?? 0, timestamp));
-      }
-      return candidates
-        .filter((user) => seen.has(user.id))
-        .sort((a, b) => (seen.get(b.id) ?? 0) - (seen.get(a.id) ?? 0))
-        .slice(0, options.limit);
+  async bootstrapKeys(
+    userId: string,
+    passwordHash: string,
+    keys: NewKeys,
+  ): Promise<{ upgraded: boolean; tokenVersion: number }> {
+    const state = memoryState();
+    const user = state.users.get(userId);
+    if (!user) return { upgraded: false, tokenVersion: 0 };
+    if (user.authVersion !== 0) return { upgraded: false, tokenVersion: user.tokenVersion };
+    user.passwordHash = passwordHash;
+    user.authVersion = 1;
+    user.tokenVersion += 1;
+    if (!state.keys.has(userId)) {
+      state.keys.set(userId, {
+        vaultId: keys.vaultId,
+        identityPub: keys.identityPub,
+        vault: { ...keys.vault, version: 1 },
+        recovery: keys.recovery,
+      });
     }
+    return { upgraded: true, tokenVersion: user.tokenVersion };
+  }
 
-    const matches = candidates.filter(
-      (user) =>
-        user.username.toLowerCase().includes(q) || user.displayName.toLowerCase().includes(q),
-    );
-    // Same ranking as the SQL: prefix hits first, then alphabetical.
-    return matches
-      .sort((a, b) => {
-        const aPrefix =
-          a.username.toLowerCase().startsWith(q) || a.displayName.toLowerCase().startsWith(q);
-        const bPrefix =
-          b.username.toLowerCase().startsWith(q) || b.displayName.toLowerCase().startsWith(q);
-        if (aPrefix !== bPrefix) return aPrefix ? -1 : 1;
-        return a.username.toLowerCase().localeCompare(b.username.toLowerCase());
-      })
-      .slice(0, options.limit);
+  async updateVault(userId: string, vault: SealedBlob, version: number): Promise<boolean> {
+    const keys = memoryState().keys.get(userId);
+    if (!keys || keys.vault.version !== version - 1) return false;
+    keys.vault = { ...vault, version };
+    return true;
   }
 
   async listRooms(): Promise<Room[]> {
@@ -736,6 +952,7 @@ class MemoryStore implements ChatStore {
       kind: 'public',
       createdBy: input.createdBy,
       createdAt: new Date().toISOString(),
+      e2eeSinceId: null,
     };
     state.rooms.set(room.id, room);
     return room;
@@ -752,11 +969,15 @@ class MemoryStore implements ChatStore {
     const users: PublicUser[] = [];
     for (const userId of members.keys()) {
       const user = state.users.get(userId);
-      if (!user) continue;
-      const { passwordHash: _ignored, ...publicUser } = user;
-      users.push(publicUser);
+      if (user) users.push(publicOf(user));
     }
     return users.sort((a, b) => a.displayName.localeCompare(b.displayName));
+  }
+
+  async findDirectRoom(userIdA: string, userIdB: string): Promise<Room | null> {
+    const state = memoryState();
+    const id = state.dmKeys.get(directKey(userIdA, userIdB));
+    return id ? (state.rooms.get(id) ?? null) : null;
   }
 
   async findOrCreateDirectRoom(
@@ -783,6 +1004,7 @@ class MemoryStore implements ChatStore {
       kind: 'dm',
       createdBy: userIdA,
       createdAt: new Date().toISOString(),
+      e2eeSinceId: null,
     };
     state.rooms.set(room.id, room);
     state.dmKeys.set(key, room.id);
@@ -816,12 +1038,17 @@ class MemoryStore implements ChatStore {
       conversations.push({
         room,
         counterpart,
+        counterpartKey: state.keys.get(counterpart.id)?.identityPub ?? null,
         lastMessage: last
           ? {
               id: last.id,
-              body: preview(last.body),
+              body: last.encVersion === 1 ? last.body : preview(last.body),
               createdAt: last.createdAt,
               authorId: last.author.id,
+              clientNonce: last.clientNonce,
+              encVersion: last.encVersion,
+              iv: last.iv,
+              epoch: last.epoch,
             }
           : null,
         unreadCount: roomMessages.filter(
@@ -868,26 +1095,48 @@ class MemoryStore implements ChatStore {
 
   async createMessage(input: CreateMessageInput): Promise<Message> {
     const state = memoryState();
-    // Scoped to the room, matching the Postgres store.
-    const nonceKey = input.clientNonce
-      ? `${input.userId}:${input.roomId}:${input.clientNonce}`
-      : null;
-    if (nonceKey && state.nonces.has(nonceKey)) {
-      const existingId = state.nonces.get(nonceKey);
-      const existing = state.messages.find((m) => m.id === existingId);
-      if (existing) return existing;
+    const encVersion = input.encVersion ?? 0;
+
+    // Mirrors the Postgres unique index on (user_id, client_nonce): a nonce is
+    // either a retry in the same room, or a conflict with another room.
+    if (input.clientNonce) {
+      const existing = state.messages.find(
+        (m) => m.author.id === input.userId && m.clientNonce === input.clientNonce,
+      );
+      if (existing) {
+        if (existing.roomId === input.roomId) return existing;
+        if (encVersion === 1) throw new NonceConflictError();
+      }
     }
+
     const author = await this.findUserById(input.userId);
     if (!author) throw new Error(`Unknown user ${input.userId}`);
+
+    const nonceTaken = input.clientNonce
+      ? state.messages.some(
+          (m) => m.author.id === input.userId && m.clientNonce === input.clientNonce,
+        )
+      : false;
+
     const message: Message = {
       id: String(state.nextMessageId++),
       roomId: input.roomId,
       body: input.body,
       createdAt: new Date().toISOString(),
       author,
+      clientNonce: nonceTaken ? null : (input.clientNonce ?? null),
+      encVersion,
+      iv: input.iv ?? null,
+      epoch: input.epoch ?? null,
     };
     state.messages.push(message);
-    if (nonceKey) state.nonces.set(nonceKey, message.id);
+
+    if (encVersion === 1) {
+      const room = state.rooms.get(input.roomId);
+      if (room && (room.e2eeSinceId === null || Number(message.id) < Number(room.e2eeSinceId))) {
+        room.e2eeSinceId = message.id;
+      }
+    }
     return message;
   }
 
