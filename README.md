@@ -118,7 +118,7 @@ friends, and seeds `#general` plus two end-to-end encrypted conversations.
 ```bash
 npm run typecheck
 npm run test:crypto                       # 24 tests of the encryption primitives
-npm run verify -- http://localhost:3000   # 89 end-to-end checks over the HTTP API
+npm run verify -- http://localhost:3000   # 83 end-to-end checks over the HTTP API
 npm run test:calls -- http://localhost:3000   # real video call between two Chromes
 ```
 
@@ -344,7 +344,7 @@ Also:
 
 ## Verified behaviour
 
-Against a production build with a real Postgres 18. `npm run verify` — **89/89**:
+Against a production build with a real Postgres 18 — and again on the live Vercel deployment against Neon. `npm run verify` — **83/83** (89/89 with `LEGACY_ACCOUNT` set):
 
 | Area | What was proven |
 | --- | --- |
@@ -405,6 +405,15 @@ The schema is applied at runtime by `ensureSchema()` in
 advisory lock so racing cold starts cannot collide. Upgrading an existing
 database backfills a friendship for every conversation that already existed, so
 nobody is locked out by a rule added later.
+
+Each schema version is recorded in `schema_migrations` once applied, so an
+ordinary cold start runs one indexed `SELECT` and no DDL. This matters on
+serverless: `ALTER TABLE … IF NOT EXISTS` takes an exclusive table lock even
+when there is nothing to change, and running it on every cold start deadlocked
+against live message inserts under load. A migration that is needed runs with a
+short `lock_timeout`, so if it collides with live traffic it is the one that
+backs off and retries. Separately, statements and transactions that Postgres
+aborts as a deadlock or serialization failure are retried automatically.
 
 Races are settled by the database rather than application code:
 

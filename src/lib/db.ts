@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import { DATABASE_URL } from './config';
 
@@ -48,33 +49,63 @@ export function getPool(): Pool {
   return global.__chatPgPool;
 }
 
+/**
+ * Serialization failure and deadlock: Postgres rolled the whole statement or
+ * transaction back, so it had no effect and is safe to run again. Postgres
+ * documents retrying these as the application's job.
+ */
+const TRANSIENT_CODES = new Set(['40001', '40P01']);
+
+function isTransient(error: unknown): boolean {
+  const code = typeof error === 'object' && error !== null ? (error as { code?: string }).code : undefined;
+  return code !== undefined && TRANSIENT_CODES.has(code);
+}
+
+async function retryTransient<T>(run: () => Promise<T>, attempts = 4): Promise<T> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await run();
+    } catch (error) {
+      if (attempt >= attempts || !isTransient(error)) throw error;
+      // Jitter so the two sides of a deadlock do not collide again in lockstep.
+      await new Promise((resolve) => setTimeout(resolve, 25 * attempt + Math.random() * 50));
+    }
+  }
+}
+
 export async function query<T extends QueryResultRow = QueryResultRow>(
   text: string,
   params: unknown[] = [],
 ): Promise<T[]> {
   await ensureSchema();
-  const result = await getPool().query<T>(text, params);
-  return result.rows;
+  return retryTransient(async () => (await getPool().query<T>(text, params)).rows);
 }
 
-/** Runs `fn` inside a transaction, always releasing the client. */
+/**
+ * Runs `fn` inside a transaction, always releasing the client. `fn` may run
+ * more than once if Postgres aborts it as a deadlock victim, so it must only
+ * touch the database through `client`.
+ */
 export async function withTransaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
-  const client = await getPool().connect();
-  try {
-    await client.query('BEGIN');
-    const result = await fn(client);
-    await client.query('COMMIT');
-    return result;
-  } catch (error) {
+  await ensureSchema();
+  return retryTransient(async () => {
+    const client = await getPool().connect();
     try {
-      await client.query('ROLLBACK');
-    } catch {
-      /* the connection is already broken; nothing useful to do */
+      await client.query('BEGIN');
+      const result = await fn(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        /* the connection is already broken; nothing useful to do */
+      }
+      throw error;
+    } finally {
+      client.release();
     }
-    throw error;
-  } finally {
-    client.release();
-  }
+  });
 }
 
 const SCHEMA_SQL = `
@@ -338,33 +369,106 @@ const SEED_ROOMS: Array<{ id: string; slug: string; name: string; topic: string 
 ];
 
 /**
- * Creates the schema on first use. Idempotent and safe to call concurrently:
- * a transaction-scoped advisory lock serialises competing cold starts, which
- * otherwise race inside `CREATE TABLE IF NOT EXISTS` on the system catalogs.
+ * Identifies this exact schema. Recorded once applied, so later cold starts
+ * skip the DDL entirely: `ALTER TABLE ... IF NOT EXISTS` takes an ACCESS
+ * EXCLUSIVE lock even when there is nothing to do, and running it on every
+ * cold start deadlocked against live message inserts under load.
+ */
+const SCHEMA_FINGERPRINT = createHash('sha256')
+  .update(SCHEMA_SQL)
+  .update(JSON.stringify(SEED_ROOMS))
+  .digest('hex')
+  .slice(0, 32);
+
+const SCHEMA_LOCK_ID = 826_141_337;
+
+/** Undefined table: the very first boot, before `schema_migrations` exists. */
+const isUndefinedTable = (error: unknown) =>
+  typeof error === 'object' && error !== null && (error as { code?: string }).code === '42P01';
+
+async function schemaApplied(client: PoolClient): Promise<boolean> {
+  try {
+    const result = await client.query('SELECT 1 FROM schema_migrations WHERE fingerprint = $1', [
+      SCHEMA_FINGERPRINT,
+    ]);
+    return (result.rowCount ?? 0) > 0;
+  } catch (error) {
+    if (isUndefinedTable(error)) return false;
+    throw error;
+  }
+}
+
+async function applySchema(client: PoolClient): Promise<void> {
+  try {
+    await client.query('BEGIN');
+    // Lose any lock conflict with live traffic quickly, well inside the 1s
+    // deadlock_timeout, so a real request is never picked as the victim.
+    await client.query("SET LOCAL lock_timeout = '750ms'");
+    // Serialises competing cold starts, which otherwise race inside
+    // `CREATE TABLE IF NOT EXISTS` on the system catalogs.
+    await client.query('SELECT pg_advisory_xact_lock($1)', [SCHEMA_LOCK_ID]);
+    // Another instance may have finished while this one waited for the lock.
+    // A failed check aborts the transaction, so it runs in a savepoint.
+    await client.query('SAVEPOINT recheck');
+    const done = await schemaApplied(client);
+    await client.query(done ? 'RELEASE SAVEPOINT recheck' : 'ROLLBACK TO SAVEPOINT recheck');
+    if (!done) {
+      await client.query(SCHEMA_SQL);
+      for (const room of SEED_ROOMS) {
+        await client.query(
+          `INSERT INTO rooms (id, slug, name, topic)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (slug) DO NOTHING`,
+          [room.id, room.slug, room.name, room.topic],
+        );
+      }
+      await client.query(
+        `CREATE TABLE IF NOT EXISTS schema_migrations (
+           fingerprint TEXT PRIMARY KEY,
+           applied_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+         )`,
+      );
+      await client.query(
+        'INSERT INTO schema_migrations (fingerprint) VALUES ($1) ON CONFLICT DO NOTHING',
+        [SCHEMA_FINGERPRINT],
+      );
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      /* ignore */
+    }
+    throw error;
+  }
+}
+
+/** Lock timeout: the migration backed off from live traffic; try again. */
+const isLockTimeout = (error: unknown) =>
+  typeof error === 'object' && error !== null && (error as { code?: string }).code === '55P03';
+
+/**
+ * Creates or upgrades the schema on first use. Idempotent and safe to call
+ * concurrently. The common case - schema already current - is one indexed
+ * SELECT and takes no table locks.
  */
 export function ensureSchema(): Promise<void> {
   if (!global.__chatSchemaReady) {
     global.__chatSchemaReady = (async () => {
       const client = await getPool().connect();
       try {
-        await client.query('BEGIN');
-        await client.query('SELECT pg_advisory_xact_lock($1)', [826_141_337]);
-        await client.query(SCHEMA_SQL);
-        for (const room of SEED_ROOMS) {
-          await client.query(
-            `INSERT INTO rooms (id, slug, name, topic)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (slug) DO NOTHING`,
-            [room.id, room.slug, room.name, room.topic],
-          );
+        if (await schemaApplied(client)) return;
+        for (let attempt = 1; ; attempt += 1) {
+          try {
+            await applySchema(client);
+            return;
+          } catch (error) {
+            if (attempt >= 8 || !(isLockTimeout(error) || isTransient(error))) throw error;
+            await new Promise((resolve) => setTimeout(resolve, 100 * attempt + Math.random() * 200));
+          }
         }
-        await client.query('COMMIT');
       } catch (error) {
-        try {
-          await client.query('ROLLBACK');
-        } catch {
-          /* ignore */
-        }
         // Let the next request retry a failed bootstrap instead of caching it.
         global.__chatSchemaReady = undefined;
         throw error;

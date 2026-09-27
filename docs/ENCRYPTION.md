@@ -190,7 +190,7 @@ ever changes.
   break them: moved, re-attributed and replayed ciphertext, a flipped byte, a
   third party's keys, a call signal served as a message, IV reuse, and that the
   auth secret the server receives cannot open the vault.
-- **`npm run verify`** - 89 end-to-end checks over the HTTP API, including that
+- **`npm run verify`** - 83 end-to-end checks over the HTTP API, including that
   the server stores only ciphertext, that the recipient decrypts it, that
   plaintext is refused once a conversation is encrypted, and that call
   signalling reaches the server sealed.
