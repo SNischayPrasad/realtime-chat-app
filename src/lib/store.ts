@@ -761,7 +761,6 @@ type MemoryState = {
   dmKeys: Map<string, string>;
   members: Map<string, Map<string, { joinedAt: number; lastReadId: number }>>;
   messages: Message[];
-  nonces: Map<string, string>;
   presence: Map<string, number>;
   typing: Map<string, number>;
   nextMessageId: number;
@@ -801,7 +800,6 @@ export function memoryState(): MemoryState {
       dmKeys: new Map(),
       members: new Map(),
       messages: [],
-      nonces: new Map(),
       presence: new Map(),
       typing: new Map(),
       nextMessageId: 1,

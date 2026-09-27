@@ -9,9 +9,10 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
-    "seed": "node scripts/seed-demo.mjs",
-    "verify": "node --experimental-strip-types scripts/verify.mjs",
-    "test:crypto": "node --test --experimental-strip-types src/lib/e2ee/crypto.test.ts"
+    "seed": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --experimental-strip-types scripts/seed-demo.mjs",
+    "verify": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --experimental-strip-types scripts/verify.mjs",
+    "test:crypto": "node --test --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --experimental-strip-types src/lib/e2ee/crypto.test.ts",
+    "test:calls": "node scripts/call-e2e.mjs"
   },
   "dependencies": {
     "next": "15.5.25",
@@ -24,6 +25,7 @@
     "@types/pg": "8.15.5",
     "@types/react": "19.1.10",
     "@types/react-dom": "19.1.7",
+    "playwright-core": "^1.63.0",
     "typescript": "5.9.2"
   },
   "engines": {

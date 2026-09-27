@@ -27,12 +27,15 @@ export default async function LoginPage() {
               <span>Messages arrive over an open event stream, not a refresh button.</span>
             </li>
             <li>
-              <b>Kept</b>
-              <span>Every message is written to Postgres, so history survives the tab closing.</span>
+              <b>Private</b>
+              <span>
+                Conversations with friends are end-to-end encrypted. The server stores only
+                ciphertext it cannot read.
+              </span>
             </li>
             <li>
-              <b>Shared</b>
-              <span>Rooms show who is present and who is mid-sentence.</span>
+              <b>Calls</b>
+              <span>Voice and video calls go directly between your browsers, encrypted.</span>
             </li>
           </ul>
         </div>
